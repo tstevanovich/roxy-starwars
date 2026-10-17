@@ -1,0 +1,55 @@
+{
+  "name": "roxy-starwars",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "engines": {
+    "node": "^24.15.0 || >=26.0.0"
+  },
+  "scripts": {
+    "dev": "node --env-file-if-exists=server/.env scripts/dev.mjs",
+    "build": "npm run build --workspace client",
+    "start": "npm run start --workspace server",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "lint:styles": "stylelint \"**/*.{css,scss}\"",
+    "lint:styles:fix": "stylelint \"**/*.{css,scss}\" --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "npm run test --workspaces --if-present && npm run test:tools",
+    "test:tools": "node --test scripts/*.test.mjs",
+    "check": "npm run format:check && npm run lint && npm run lint:styles && npm test && npm run build",
+    "db:up": "docker compose up -d mongo",
+    "db:down": "docker compose down"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "concurrently": "^10.0.6",
+    "eslint": "^10.12.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.7",
+    "eslint-plugin-simple-import-sort": "^14.0.0",
+    "eslint-plugin-testing-library": "^7.16.2",
+    "globals": "^17.13.0",
+    "mongodb": "^7.7.0",
+    "mongodb-memory-server": "^11.3.0",
+    "postcss": "^8.5.30",
+    "prettier": "^3.9.10",
+    "stylelint": "^17.16.0",
+    "stylelint-config-recess-order": "^7.8.0",
+    "stylelint-config-standard": "^40.0.0",
+    "stylelint-config-standard-scss": "^17.0.0",
+    "stylelint-order": "^8.1.2",
+    "supertest": "^7.3.1",
+    "typescript": "~6.0.0",
+    "typescript-eslint": "^8.71.2"
+  },
+  "overrides": {
+    "braces": "npm:@dieub/braces-depth-guard@3.0.3-pn.3"
+  }
+}

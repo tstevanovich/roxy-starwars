@@ -1,0 +1,25 @@
+{
+  "[xml]": {
+    "editor.defaultFormatter": "redhat.vscode-xml"
+  },
+  "[yaml]": {
+    "editor.defaultFormatter": "redhat.vscode-yaml"
+  },
+  "css.validate": false,
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit",
+    "source.fixAll.stylelint": "explicit"
+  },
+  "editor.defaultFormatter": "esbenp.prettier-vscode",
+  "editor.formatOnSave": true,
+  "eslint.validate": ["javascript", "javascriptreact", "typescript", "typescriptreact"],
+  "eslint.workingDirectories": ["."],
+  "files.eol": "\n",
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true,
+  "js/ts.tsdk.path": "node_modules/typescript/lib",
+  "prettier.requireConfig": true,
+  "scss.validate": false,
+  "stylelint.lintFiles.glob": "client/src/**/*.{css,scss}",
+  "stylelint.validate": ["css", "scss"]
+}
