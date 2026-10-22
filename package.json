@@ -24,7 +24,14 @@
     "test:tools": "node --test scripts/*.test.mjs",
     "check": "npm run format:check && npm run lint && npm run lint:styles && npm test && npm run build",
     "db:up": "docker compose up -d mongo",
-    "db:down": "docker compose down"
+    "db:down": "docker compose down",
+    "auth:setup": "node scripts/auth-setup.mjs",
+    "auth:reset": "node scripts/auth-setup.mjs --reset",
+    "studio": "node --env-file-if-exists=server/.env scripts/studio.mjs",
+    "remote:install": "node scripts/remote-install.mjs",
+    "remote:start": "node scripts/remote.mjs start",
+    "remote:status": "node scripts/remote.mjs status",
+    "remote:stop": "node scripts/remote.mjs stop"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

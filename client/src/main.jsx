@@ -8,6 +8,7 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 
 import App from './App.jsx';
+import AuthGate from './AuthGate.jsx';
 import { theme } from './theme.js';
 
 createRoot(document.getElementById('root')).render(
@@ -15,7 +16,7 @@ createRoot(document.getElementById('root')).render(
     <ThemeProvider theme={theme}>
       <LocalizationProvider dateAdapter={AdapterDayjs}>
         <CssBaseline />
-        <App />
+        <AuthGate>{(account) => <App account={account} />}</AuthGate>
       </LocalizationProvider>
     </ThemeProvider>
   </StrictMode>

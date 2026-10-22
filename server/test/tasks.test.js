@@ -10,7 +10,7 @@ import { connectDatabase } from '../src/db.js';
 import { Task } from '../src/models/Task.js';
 
 let mongo;
-const app = createApp();
+const app = createApp({ auth: false });
 
 before(
   async () => {

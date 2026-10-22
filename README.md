@@ -1,6 +1,10 @@
 # Roxy Star Wars
 
-A JavaScript MERN starter with a React + Vite client using Material UI (MUI), an Express API, and MongoDB through Mongoose. The example task list supports creating, listing, completing, renaming through the API, and deleting records.
+A local production studio for the Roxy Kane series, built with React, Material UI, Express, and MongoDB. Review creative directions, import original images/video/audio, finalize reusable assets, and prepare episode scenes and editing packages.
+
+Read the [studio guide](docs/STUDIO-GUIDE.md) for saving choices, local storage, scene approvals, and CapCut exports. The [production brief](docs/PRODUCTION-BRIEF.md) records the creative requirements. [Production chat](docs/PRODUCTION-CHAT.md) adds story collaboration, reviewable scene drafts, OpenArt render requests and ElevenLabs dialogue generation. Each scene also has a sound-design plan, individual effects review, and local FFmpeg mixing before new video approval; see the [sound workflow](docs/STUDIO-GUIDE.md#sound-design-and-finished-video-review). FFmpeg and FFprobe must be on PATH (or set FFMPEG_PATH and FFPROBE_PATH). Connect your ChatGPT plan on the studio PC through its owner-only Connections screen. Studio chat has no API-key billing fallback; OpenArt and ElevenLabs use their own accounts/credits.
+
+The studio now requires your single-owner login on desktop and phone. See [remote access and account setup](docs/REMOTE-ACCESS.md) for your private HTTPS tunnel, first sign-in, mobile controls, starting/stopping access and local password recovery.
 
 ## Requirements
 
@@ -30,8 +34,11 @@ You can also choose another database:
 Then run:
 
 ```powershell
+npm.cmd run auth:setup
 npm.cmd run dev
 ```
+
+The owner setup command preserves existing credentials. On first use, open the development setup link in `.data/private/owner-access.txt` and choose your password. There is no public registration.
 
 Open <http://127.0.0.1:5173>. Vite proxies `/api` requests to Express at <http://127.0.0.1:5000>. The app does not open a browser automatically. Ctrl+C stops the development processes and any database started by the launcher, preserving application data.
 
@@ -41,8 +48,13 @@ The launcher reuses a database already listening on port 27017. For a custom URI
 
 ```text
 client/
-  src/App.jsx             Task list and request state
-  src/App.test.jsx        MUI task interaction tests
+  src/App.jsx             Production dashboard and workspace navigation
+  src/AssetLibrary.jsx    Candidate review, reference uploads, and final choices
+  src/Episodes.jsx        Episode scripts, clip plans, approvals, and exports
+  src/ProductionChat.jsx  Mobile production conversations, connections and job tracking
+  src/StudioMedia.jsx     Local media library and inline playback
+  src/SeriesBible.jsx     Editable series settings
+  src/App.test.jsx        Studio interaction and draft-preservation tests
   src/api.js              Shared fetch helper
   src/theme.js            Shared MUI palette, typography, and component defaults
   src/styles.css          Fonts and root sizing
@@ -54,6 +66,11 @@ server/
   src/db.js               MongoDB connection
   src/models/Task.js      Mongoose schema
   src/routes/tasks.js     Validated CRUD endpoints
+  src/routes/studio.js    Studio records, approvals, and export endpoints
+  src/models/Studio.js    Assets, media metadata, episodes, and series settings
+  src/studio-media.js     Local file imports and range playback
+  src/assistant/          OpenAI tool loop, OpenArt OAuth, durable jobs and story proposals
+  test/studio.test.js     Studio persistence, media, approvals, and export tests
   test/tasks.test.js      Integration tests against temporary MongoDB
   .env.example            Environment template
 compose.yaml              Optional local MongoDB container
@@ -68,6 +85,13 @@ scripts/local-database.mjs Persistent local development database
 | `npm.cmd run dev`             | Start React and Express with automatic reload                                  |
 | `npm.cmd run build`           | Build React into `client/dist`                                                 |
 | `npm.cmd start`               | Run Express; uses `server/.env`                                                |
+| `npm.cmd run auth:setup`      | Prepare the single owner and private first-sign-in instructions                |
+| `npm.cmd run auth:reset`      | Recover the owner locally and revoke previous sessions                         |
+| `npm.cmd run studio`          | Start the built, authenticated studio with local database readiness            |
+| `npm.cmd run remote:install`  | Download and verify the official Windows tunnel executable                     |
+| `npm.cmd run remote:start`    | Start the authenticated studio's HTTPS tunnel                                  |
+| `npm.cmd run remote:status`   | Show the verified tunnel state and current address                             |
+| `npm.cmd run remote:stop`     | Stop the studio tunnel while retaining the local studio                        |
 | `npm.cmd test`                | Run frontend interaction tests and API integration tests                       |
 | `npm.cmd run lint`            | Check JavaScript and React                                                     |
 | `npm.cmd run lint:fix`        | Fix supported lint issues, including import ordering                           |
@@ -108,7 +132,7 @@ The client uses Material UI (MUI) with the Emotion styling engine and Material i
 
 MUI X Date Pickers and Day.js are installed in the client workspace. The root `LocalizationProvider` uses `AdapterDayjs`, so date and time pickers can be added anywhere in the app. Use Day.js objects (or `null` for an empty value) for picker values.
 
-`npm.cmd test` runs both workspaces and the development database tests: the client checks loading, task creation/completion/deletion, retry, and failed mutations; the server tests the real MongoDB API. Run `npm.cmd run test:watch --workspace client` for interactive frontend testing. Client tests mock the request helper and do not require a running API or database.
+`npm.cmd test` runs both workspaces and the development tooling tests. Client tests cover navigation, local draft preservation after conflicts, media attachment and finalization, retry, and flexible episode clip durations. Server tests exercise MongoDB records, original file storage, HEAD/range playback, final-choice history, stale approvals, validation, and ZIP export. The original task API tests remain. Run `npm.cmd run test:watch --workspace client` for interactive frontend testing. Client tests mock the request helper and do not require a running API or database.
 
 Stylelint checks CSS and SCSS files; it does not inspect MUI `sx` objects inside JavaScript.
 

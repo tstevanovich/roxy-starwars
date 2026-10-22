@@ -1,347 +1,658 @@
-import AddRounded from '@mui/icons-material/AddRounded';
-import ArrowOutwardRounded from '@mui/icons-material/ArrowOutwardRounded';
-import DeleteOutlineRounded from '@mui/icons-material/DeleteOutlineRounded';
-import SubdirectoryArrowRightRounded from '@mui/icons-material/SubdirectoryArrowRightRounded';
-import Alert from '@mui/material/Alert';
-import Box from '@mui/material/Box';
-import Button from '@mui/material/Button';
-import Checkbox from '@mui/material/Checkbox';
-import Chip from '@mui/material/Chip';
-import CircularProgress from '@mui/material/CircularProgress';
-import Container from '@mui/material/Container';
-import Divider from '@mui/material/Divider';
-import FormControlLabel from '@mui/material/FormControlLabel';
-import IconButton from '@mui/material/IconButton';
-import Link from '@mui/material/Link';
-import List from '@mui/material/List';
-import ListItem from '@mui/material/ListItem';
-import Paper from '@mui/material/Paper';
-import Stack from '@mui/material/Stack';
-import TextField from '@mui/material/TextField';
-import Typography from '@mui/material/Typography';
-import { useEffect, useState } from 'react';
+import ArrowForwardOutlined from '@mui/icons-material/ArrowForwardOutlined';
+import AutoStoriesOutlined from '@mui/icons-material/AutoStoriesOutlined';
+import ChatOutlined from '@mui/icons-material/ChatOutlined';
+import CheckCircleOutlined from '@mui/icons-material/CheckCircleOutlined';
+import CollectionsOutlined from '@mui/icons-material/CollectionsOutlined';
+import DashboardOutlined from '@mui/icons-material/DashboardOutlined';
+import MenuOutlined from '@mui/icons-material/MenuOutlined';
+import MovieCreationOutlined from '@mui/icons-material/MovieCreationOutlined';
+import RocketLaunchOutlined from '@mui/icons-material/RocketLaunchOutlined';
+import TuneOutlined from '@mui/icons-material/TuneOutlined';
+import {
+  Alert,
+  Box,
+  Button,
+  Chip,
+  CircularProgress,
+  Divider,
+  Drawer,
+  IconButton,
+  LinearProgress,
+  Stack,
+  Typography
+} from '@mui/material';
+import { lazy, Suspense, useEffect, useState } from 'react';
 
+import { removeMediaReferences } from '../../shared/media-rejection.js';
+import { imageGenerationDefaults } from '../../shared/production-defaults.js';
 import { request } from './api.js';
-
-export default function App() {
-  const [tasks, setTasks] = useState([]);
-  const [title, setTitle] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const [reload, setReload] = useState(0);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    request('/tasks', { signal: controller.signal })
-      .then((data) => setTasks(data.tasks))
-      .catch((error) => {
-        if (!controller.signal.aborted) {
-          setError(
-            `Could not load tasks. Check that the API and MongoDB are running. ${error.message}`
-          );
-        }
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
-      });
-    return () => controller.abort();
-  }, [reload]);
-
-  async function mutate(operation) {
-    setBusy(true);
-    setError('');
-    try {
-      await operation();
-    } catch (error) {
-      setError(error.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function addTask(event) {
-    event.preventDefault();
-    if (!title.trim() || busy) return;
-    await mutate(async () => {
-      const { task } = await request('/tasks', {
-        method: 'POST',
-        body: { title: title.trim() }
-      });
-      setTasks((current) => [task, ...current]);
-      setTitle('');
-    });
-  }
-
-  function toggleTask(task) {
-    return mutate(async () => {
-      const { task: updated } = await request(`/tasks/${task._id}`, {
-        method: 'PATCH',
-        body: { completed: !task.completed }
-      });
-      setTasks((current) => current.map((item) => (item._id === updated._id ? updated : item)));
-    });
-  }
-
-  function deleteTask(task) {
-    return mutate(async () => {
-      await request(`/tasks/${task._id}`, { method: 'DELETE' });
-      setTasks((current) => current.filter((item) => item._id !== task._id));
-    });
-  }
-
-  function retry() {
-    setError('');
-    setLoading(true);
-    setReload((value) => value + 1);
-  }
-
-  const completed = tasks.filter((task) => task.completed).length;
-
+import { AccountControls } from './AuthGate.jsx';
+import SeriesBible from './SeriesBible.jsx';
+import {
+  assetStatus,
+  assetStatusColor,
+  assetStatuses,
+  forgetRejectedMedia,
+  pendingVideoChoices
+} from './studio-utils.js';
+import MediaLibrary, { ReferencePreview } from './StudioMedia.jsx';
+const AssetLibrary = lazy(() => import('./AssetLibrary.jsx'));
+const Episodes = lazy(() => import('./Episodes.jsx'));
+const ProductionChat = lazy(() => import('./ProductionChat.jsx'));
+const navigation = [
+  ['overview', 'Overview', DashboardOutlined],
+  ['library', 'Creative library', CollectionsOutlined],
+  ['episodes', 'Episodes', MovieCreationOutlined],
+  ['chat', 'Production chat', ChatOutlined],
+  ['media', 'Media library', TuneOutlined],
+  ['bible', 'Series bible', AutoStoriesOutlined]
+];
+function Overview({ data, navigate }) {
+  const active = data.assets.filter((a) => !a.archived);
+  const finalized = active.filter((a) => assetStatus(a) === 'finalized');
+  const pending = active.filter((a) => assetStatus(a) === 'pending-choice');
+  const pendingVideos = data.episodes.reduce(
+    (count, episode) => count + pendingVideoChoices(episode, data.media).length,
+    0
+  );
+  const featured = ['fortune', 'al', 'roxy-voice']
+    .map((key) => active.find((a) => a.seedKey === key))
+    .filter(Boolean);
   return (
-    <Container component="main" maxWidth={false} sx={{ maxWidth: 1080, px: { xs: 2.5, sm: 6 } }}>
-      <Stack
-        component="header"
-        direction="row"
-        alignItems="center"
-        justifyContent="space-between"
-        spacing={2}
-        sx={{ py: { xs: 2.75, sm: 3.75 }, borderBottom: 1, borderColor: 'divider' }}
-      >
-        <Link
-          href="/"
-          aria-label="Roxy Star Wars home"
-          underline="none"
-          color="text.primary"
+    <Stack spacing={4}>
+      <Box className="studio-hero">
+        <Box
           sx={{
-            display: 'inline-flex',
-            alignItems: 'center',
-            gap: 1.25,
-            fontSize: 23,
-            fontWeight: 700
+            position: 'relative',
+            zIndex: 1,
+            maxWidth: 590
           }}
         >
-          <Box
-            component="span"
-            aria-hidden="true"
+          <Typography
+            variant="overline"
             sx={{
-              width: 36,
-              height: 36,
-              borderRadius: '11px',
-              bgcolor: 'primary.main',
-              color: '#dcf299',
-              textAlign: 'center',
-              lineHeight: '34px',
-              fontSize: 27
+              color: '#e4ce92'
             }}
           >
-            r.
-          </Box>
-          Roxy Star Wars
-        </Link>
-        <Typography variant="overline" color="text.secondary" sx={{ fontSize: { xs: 9, sm: 11 } }}>
-          MERN STARTER / 01
-        </Typography>
-      </Stack>
-
-      <Box component="section" aria-labelledby="page-title" sx={{ pt: { xs: 5, sm: 8 }, pb: 5 }}>
-        <Typography component="p" variant="overline" color="secondary.dark" sx={{ mb: 2 }}>
-          A foundation for your next idea
-        </Typography>
-        <Typography component="h1" variant="h1" id="page-title">
-          Start small.
-          <br />
-          <Box component="span" sx={{ color: 'secondary.main' }}>
-            Build something great.
-          </Box>
-        </Typography>
-        <Typography color="text.secondary" sx={{ maxWidth: 490, lineHeight: 1.7, my: 3 }}>
-          Your React workspace, connected to an Express API and MongoDB. Add a task below to try the
-          full stack.
-        </Typography>
-        <Stack direction="row" useFlexGap spacing={1} flexWrap="wrap" aria-label="Technology stack">
-          {['MongoDB', 'Express', 'React', 'Node.js'].map((name) => (
-            <Chip key={name} label={name} variant="outlined" size="small" />
-          ))}
-        </Stack>
-      </Box>
-
-      <Paper
-        component="section"
-        variant="outlined"
-        aria-labelledby="tasks-title"
-        sx={{ p: { xs: 2.5, sm: 3.75 }, borderRadius: '18px', boxShadow: '0 8px 30px #17342f04' }}
-      >
-        <Stack
-          direction="row"
-          alignItems="center"
-          justifyContent="space-between"
-          spacing={2}
-          sx={{ mb: 3 }}
-        >
-          <Box>
-            <Typography component="p" variant="overline" color="secondary.dark" sx={{ mb: 0.75 }}>
-              Your first collection
-            </Typography>
-            <Typography component="h2" variant="h2" id="tasks-title">
-              The starting list
-            </Typography>
-          </Box>
-          <Chip
-            label={`${completed} / ${tasks.length} complete`}
-            size="small"
-            sx={{ bgcolor: 'secondary.light' }}
-          />
-        </Stack>
-
-        <Stack
-          component="form"
-          onSubmit={addTask}
-          direction={{ xs: 'column', sm: 'row' }}
-          spacing={1.25}
-        >
-          <TextField
-            id="task-title"
-            label="New task"
-            placeholder="What would you like to build?"
-            value={title}
-            onChange={(event) => setTitle(event.target.value)}
-            slotProps={{ htmlInput: { maxLength: 200 } }}
-            required
-            disabled={busy || loading}
-            autoComplete="off"
-            fullWidth
-          />
-          <Button
-            variant="contained"
-            type="submit"
-            disabled={busy || loading || !title.trim()}
-            endIcon={<ArrowOutwardRounded />}
-            sx={{ flexShrink: 0, px: 2.5 }}
+            ROXY KANE / SERIES DEVELOPMENT
+          </Typography>
+          <Typography component="h1" className="hero-title">
+            A galaxy of choices.
+            <br />
+            <span>One consistent world.</span>
+          </Typography>
+          <Typography
+            sx={{
+              maxWidth: 470,
+              color: '#d2d4c8',
+              lineHeight: 1.8,
+              my: 3
+            }}
           >
-            Add task
-          </Button>
-        </Stack>
-
-        {error && (
-          <Alert
-            severity="error"
-            sx={{ mt: 2 }}
-            action={
-              <Button color="inherit" disabled={busy || loading} onClick={retry}>
-                Try again
-              </Button>
-            }
+            Shape the Fortune, meet AL, and build the creative library behind Roxy’s next job. Every
+            final choice has a place to live.
+          </Typography>
+          <Stack
+            direction="row"
+            sx={{
+              gap: 1.5,
+              flexWrap: 'wrap'
+            }}
           >
-            {error}
-          </Alert>
-        )}
-
-        <Box aria-live="polite" aria-busy={loading}>
-          {loading ? (
-            <Stack
-              direction="row"
-              spacing={1.5}
-              alignItems="center"
-              justifyContent="center"
-              sx={{ py: 5 }}
+            <Button
+              variant="contained"
+              color="secondary"
+              endIcon={<ArrowForwardOutlined />}
+              onClick={() => navigate('library')}
             >
-              <CircularProgress size={20} aria-label="Loading tasks" />
-              <Typography variant="body2" color="text.secondary">
-                Connecting to your workspace…
-              </Typography>
-            </Stack>
-          ) : tasks.length === 0 ? (
-            <Box sx={{ py: 4.5, px: 1, textAlign: 'center' }}>
+              Explore the library
+            </Button>
+            <Button
+              variant="outlined"
+              sx={{
+                color: '#f5f1e6',
+                borderColor: '#727b66'
+              }}
+              onClick={() => navigate('episodes', '', true)}
+            >
+              Start an episode
+            </Button>
+          </Stack>
+        </Box>
+        <Box className="hero-orbit orbit-one" />
+        <Box className="hero-orbit orbit-two" />
+        <RocketLaunchOutlined className="hero-ship" />
+      </Box>
+      <Box className="stats-grid">
+        {[
+          [
+            active.filter((a) => a.scope !== 'episode').length,
+            'Reusable assets',
+            `${active.filter((a) => a.scope === 'episode').length} episode-only assets`
+          ],
+          [
+            pending.length + pendingVideos,
+            'Pending choices',
+            'Assets and video clips awaiting your decision'
+          ],
+          [data.episodes.length, 'Episodes', 'Stories taking shape'],
+          [data.media.length, 'Local files', 'Originals kept on this computer']
+        ].map(([value, title, subtitle]) => (
+          <Box component="section" aria-label={title} className="stat-card" key={title}>
+            <Typography className="stat-number">{String(value).padStart(2, '0')}</Typography>
+            <Typography
+              sx={{
+                fontWeight: 600
+              }}
+            >
+              {title}
+            </Typography>
+            <Typography variant="caption" color="text.secondary">
+              {subtitle}
+            </Typography>
+          </Box>
+        ))}
+      </Box>
+      <Stack
+        direction="row"
+        sx={{
+          justifyContent: 'space-between',
+          alignItems: 'center'
+        }}
+      >
+        <Box>
+          <Typography variant="overline">THE RECURRING CAST AND WORLD</Typography>
+          <Typography variant="h2">On the drawing board</Typography>
+        </Box>
+        <Button onClick={() => navigate('library')} endIcon={<ArrowForwardOutlined />}>
+          All assets
+        </Button>
+      </Stack>
+      <Box className="featured-grid">
+        {featured.map((asset) => {
+          const candidate = asset.finalChoice;
+          return (
+            <Box className="asset-card" key={asset._id}>
+              <ReferencePreview
+                kind={asset.kind}
+                file={data.media.find((m) => m._id === candidate?.mediaIds?.[0])}
+              />
               <Box
                 sx={{
-                  display: 'inline-flex',
-                  p: 1.25,
-                  bgcolor: 'secondary.light',
-                  borderRadius: '14px',
-                  color: 'secondary.main'
+                  p: 2.5
                 }}
               >
-                <AddRounded fontSize="large" />
-              </Box>
-              <Typography component="h3" variant="subtitle1" sx={{ mt: 2, mb: 0.75 }}>
-                A little room for big ideas.
-              </Typography>
-              <Typography variant="body2" color="text.secondary">
-                Your tasks will appear here. Add your first one above.
-              </Typography>
-            </Box>
-          ) : (
-            <List disablePadding sx={{ my: 2 }}>
-              {tasks.map((task) => (
-                <ListItem
-                  key={task._id}
-                  divider
-                  disableGutters
-                  sx={{ py: 1.5, pr: 6 }}
-                  secondaryAction={
-                    <IconButton
-                      edge="end"
-                      color="error"
-                      disabled={busy}
-                      aria-label={`Delete ${task.title}`}
-                      onClick={() => deleteTask(task)}
-                    >
-                      <DeleteOutlineRounded />
-                    </IconButton>
-                  }
+                <Chip
+                  size="small"
+                  label={assetStatuses[assetStatus(asset)]}
+                  color={assetStatusColor(asset)}
+                />
+                <Typography
+                  variant="h3"
+                  sx={{
+                    mt: 2,
+                    mb: 1
+                  }}
                 >
-                  <FormControlLabel
-                    sx={{ m: 0, minWidth: 0 }}
-                    control={
-                      <Checkbox
-                        checked={task.completed}
-                        disabled={busy}
-                        onChange={() => toggleTask(task)}
-                      />
-                    }
-                    label={
-                      <Typography
-                        variant="body2"
-                        sx={{
-                          overflowWrap: 'anywhere',
-                          textDecoration: task.completed ? 'line-through' : 'none',
-                          color: task.completed ? 'text.secondary' : 'text.primary'
-                        }}
-                      >
-                        {task.title}
-                      </Typography>
-                    }
-                  />
-                </ListItem>
-              ))}
-            </List>
+                  {asset.name}
+                </Typography>
+                <Typography variant="body2" color="text.secondary" className="line-clamp">
+                  {asset.brief}
+                </Typography>
+                <Button
+                  onClick={() => navigate('library', asset._id)}
+                  endIcon={<ArrowForwardOutlined />}
+                  sx={{
+                    mt: 2
+                  }}
+                >
+                  Review options
+                </Button>
+              </Box>
+            </Box>
+          );
+        })}
+      </Box>
+      <Box className="bottom-grid">
+        <Box className="editor-panel">
+          <Typography variant="overline">CREATIVE READINESS</Typography>
+          <Typography
+            variant="h2"
+            sx={{
+              my: 1.5
+            }}
+          >
+            {finalized.length} of {active.length} current assets finalized
+          </Typography>
+          <LinearProgress
+            variant="determinate"
+            value={active.length ? (finalized.length / active.length) * 100 : 0}
+            sx={{
+              height: 7,
+              borderRadius: 2,
+              my: 2
+            }}
+          />
+          <Typography variant="body2" color="text.secondary">
+            Upload references, compare directions, then finalize the version that belongs in the
+            series.
+          </Typography>
+          {finalized.slice(-3).map((a) => (
+            <Stack
+              key={a._id}
+              direction="row"
+              sx={{
+                alignItems: 'center',
+                gap: 1,
+                mt: 2
+              }}
+            >
+              <CheckCircleOutlined color="success" fontSize="small" />
+              <Typography variant="body2">
+                {a.name} · {a.finalChoice.title}
+              </Typography>
+            </Stack>
+          ))}
+        </Box>
+        <Box className="editor-panel">
+          <Typography variant="overline">THE PRODUCTION APPROACH</Typography>
+          <Typography
+            variant="h2"
+            sx={{
+              my: 1.5
+            }}
+          >
+            Story first. Scenes set the pace.
+          </Typography>
+          <Typography variant="body2" color="text.secondary">
+            Roughly {data.settings.vlogPercent}% personal vlog, with cinematic dialogue and action
+            filling the rest. Flexible clips, sound effects, and no generated music.
+          </Typography>
+          <Divider
+            sx={{
+              my: 2
+            }}
+          />
+          <Typography variant="body2">
+            {imageGenerationDefaults.displayName} · Wan 3.0 · ElevenLabs
+          </Typography>
+          <Typography variant="caption" color="text.secondary">
+            Review locally. Assemble and add music in CapCut.
+          </Typography>
+        </Box>
+      </Box>
+    </Stack>
+  );
+}
+export default function App({ account }) {
+  const [chatContext, setChatContext] = useState({});
+  const [mobileMenu, setMobileMenu] = useState(false);
+  const [data, setData] = useState(null);
+  const [error, setError] = useState('');
+  const [reload, setReload] = useState(0);
+  const [page, setPage] = useState(() =>
+    new URLSearchParams(window.location.search).has('chat')
+      ? 'chat'
+      : new URLSearchParams(window.location.search).has('asset')
+        ? 'library'
+        : new URLSearchParams(window.location.search).has('episode')
+          ? 'episodes'
+          : 'overview'
+  );
+  const [initialId, setInitialId] = useState(
+    () =>
+      new URLSearchParams(window.location.search).get('asset') ||
+      new URLSearchParams(window.location.search).get('episode') ||
+      ''
+  );
+  const [createEpisode, setCreateEpisode] = useState(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    let inFlight = false;
+    async function refresh() {
+      if (inFlight || controller.signal.aborted) return;
+      inFlight = true;
+      try {
+        const next = await request('/studio', { signal: controller.signal });
+        if (!controller.signal.aborted) {
+          setData((old) => (JSON.stringify(old) === JSON.stringify(next) ? old : next));
+          setError('');
+        }
+      } catch (e) {
+        if (!controller.signal.aborted) setError(e.message);
+      } finally {
+        inFlight = false;
+      }
+    }
+    const refreshVisible = () => {
+      if (!document.hidden) void refresh();
+    };
+    void refresh();
+    window.addEventListener('focus', refreshVisible);
+    document.addEventListener('visibilitychange', refreshVisible);
+    const timer = window.setInterval(refreshVisible, 30000);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+      window.removeEventListener('focus', refreshVisible);
+      document.removeEventListener('visibilitychange', refreshVisible);
+    };
+  }, [reload]);
+  function navigate(next, id = '', create = false) {
+    const address = new URL(window.location.href);
+    for (const key of ['asset', 'episode', 'chat']) address.searchParams.delete(key);
+    if (next === 'chat') address.searchParams.set('chat', '1');
+    if (next === 'library' && id) address.searchParams.set('asset', id);
+    if (next === 'episodes' && id) address.searchParams.set('episode', id);
+    window.history.replaceState({}, '', address.pathname + address.search + address.hash);
+    if (next !== 'chat') setChatContext({});
+    setMobileMenu(false);
+    setPage(next);
+    setInitialId(id);
+    setCreateEpisode(create);
+    window.scrollTo?.({
+      top: 0,
+      behavior: 'instant'
+    });
+  }
+  function updateRecord(collection, record) {
+    setData((old) => ({
+      ...old,
+      [collection]: old[collection].some((x) => x._id === record._id)
+        ? old[collection].map((x) => (x._id === record._id ? record : x))
+        : [...old[collection], record]
+    }));
+    if (collection === 'assets')
+      request('/studio')
+        .then((next) =>
+          setData((old) => ({
+            ...old,
+            episodes: next.episodes
+          }))
+        )
+        .catch(() => {});
+  }
+  const onMedia = (file) =>
+    setData((old) => ({
+      ...old,
+      media: old.media.some((m) => m._id === file._id) ? old.media : [file, ...old.media]
+    }));
+  async function onRejected({ deletedMediaId }) {
+    forgetRejectedMedia(deletedMediaId);
+    setData((old) => ({
+      ...old,
+      media: old.media.filter((file) => file._id !== deletedMediaId),
+      assets: old.assets.map((asset) => removeMediaReferences(asset, deletedMediaId)),
+      episodes: old.episodes.map((episode) => removeMediaReferences(episode, deletedMediaId))
+    }));
+    try {
+      setData(await request('/studio'));
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+  return (
+    <Box className="studio-shell">
+      <Box className="mobile-app-bar" component="header">
+        <IconButton aria-label="Open studio menu" onClick={() => setMobileMenu(true)}>
+          <MenuOutlined />
+        </IconButton>
+        <Box>
+          <Typography fontWeight={700}>ROXY KANE</Typography>
+          <Typography variant="caption">
+            {navigation.find(([value]) => value === page)?.[1]}
+          </Typography>
+        </Box>
+      </Box>
+      <Drawer
+        open={mobileMenu}
+        onClose={() => setMobileMenu(false)}
+        slotProps={{
+          paper: {
+            sx: { width: 280, maxWidth: '85vw', bgcolor: '#202b22', color: '#faf9f1', p: 2 }
+          }
+        }}
+      >
+        <Typography variant="h2" sx={{ p: 2 }}>
+          Your studio
+        </Typography>
+        <Box component="nav" aria-label="Mobile studio navigation">
+          {navigation.map(([value, label, Icon]) => (
+            <Button
+              key={value}
+              fullWidth
+              startIcon={<Icon />}
+              aria-current={page === value ? 'page' : undefined}
+              onClick={() => navigate(value)}
+              sx={{
+                justifyContent: 'flex-start',
+                minHeight: 52,
+                color: page === value ? '#fff' : '#c4cbbf',
+                bgcolor: page === value ? '#3a4b38' : 'transparent',
+                mb: 1
+              }}
+            >
+              {label}
+            </Button>
+          ))}
+        </Box>
+        <Button onClick={() => setMobileMenu(false)} sx={{ color: '#dfcc93', mt: 2 }}>
+          Close menu
+        </Button>
+      </Drawer>
+      <Box component="aside" className="sidebar">
+        <Box className="brand">
+          <Box className="brand-mark">RK</Box>
+          <Box>
+            <Typography
+              sx={{
+                fontWeight: 700
+              }}
+            >
+              ROXY KANE
+            </Typography>
+            <Typography
+              variant="caption"
+              sx={{
+                letterSpacing: '0.13em',
+                color: '#b9c0ac'
+              }}
+            >
+              PRODUCTION STUDIO
+            </Typography>
+          </Box>
+        </Box>
+        <Typography
+          variant="overline"
+          sx={{
+            color: '#9da891',
+            px: 2,
+            mt: 4,
+            mb: 1
+          }}
+        >
+          YOUR WORKSPACE
+        </Typography>
+        <Box component="nav" aria-label="Studio navigation">
+          {navigation.map(([value, label, Icon]) => (
+            <Button
+              key={value}
+              className={`nav-button ${page === value ? 'active' : ''}`}
+              startIcon={<Icon />}
+              aria-current={page === value ? 'page' : undefined}
+              onClick={() => navigate(value)}
+            >
+              {label}
+            </Button>
+          ))}
+        </Box>
+        <Box className="sidebar-bottom">
+          <Chip
+            label="LOCAL WORKSPACE"
+            size="small"
+            sx={{
+              bgcolor: '#344330',
+              color: '#d8e6c5',
+              mb: 2
+            }}
+          />
+          <Typography
+            variant="body2"
+            sx={{
+              color: '#d1d7c8'
+            }}
+          >
+            Your world stays with you.
+          </Typography>
+          <Typography
+            variant="caption"
+            sx={{
+              color: '#a4b098',
+              display: 'block',
+              mt: 1
+            }}
+          >
+            Creative records and original media saved on this computer.
+          </Typography>
+        </Box>
+      </Box>
+      <Box className="studio-main">
+        <Box component="header" className="topbar">
+          <Typography variant="body2" color="text.secondary">
+            Roxy Star Wars <span className="breadcrumb-separator">/</span>{' '}
+            {navigation.find(([value]) => value === page)?.[1]}
+          </Typography>
+          <Button size="small" onClick={() => setReload((n) => n + 1)}>
+            Refresh workspace
+          </Button>
+          <Chip
+            size="small"
+            label={data ? 'Workspace connected' : 'Connecting…'}
+            color={data ? 'success' : 'default'}
+            variant="outlined"
+          />
+          {account && (
+            <AccountControls
+              username={account.session.username}
+              onSignedOut={account.onSignedOut}
+              onSession={account.onSession}
+            />
           )}
         </Box>
-
-        <Divider />
-        <Stack direction="row" spacing={1} alignItems="center" sx={{ pt: 2 }}>
-          <SubdirectoryArrowRightRounded fontSize="small" color="secondary" />
-          <Typography variant="caption" color="text.secondary">
-            Saved in MongoDB. Ready for your next visit.
-          </Typography>
-        </Stack>
-      </Paper>
-
-      <Stack
-        component="footer"
-        direction={{ xs: 'column', sm: 'row' }}
-        justifyContent="space-between"
-        spacing={1}
-        sx={{ py: 3.5 }}
-      >
-        <Typography variant="caption" color="text.secondary">
-          Made to be made your own.
-        </Typography>
-        <Typography variant="caption" color="text.secondary">
-          Roxy Star Wars / Development workspace
-        </Typography>
-      </Stack>
-    </Container>
+        <Box component="main" className="workspace-content">
+          <Suspense fallback={<CircularProgress aria-label="Opening workspace" />}>
+            {error && (
+              <Alert
+                severity="error"
+                action={
+                  <Button
+                    color="inherit"
+                    onClick={() => {
+                      setError('');
+                      setReload((n) => n + 1);
+                    }}
+                  >
+                    Retry connection
+                  </Button>
+                }
+              >
+                {error} Check that the local server and database are running.
+              </Alert>
+            )}
+            {!data && !error && (
+              <Stack
+                spacing={2}
+                sx={{
+                  alignItems: 'center',
+                  py: 12
+                }}
+              >
+                <CircularProgress aria-label="Loading studio" />
+                <Typography>Opening your production studio…</Typography>
+              </Stack>
+            )}
+            {data && page === 'overview' && (
+              <Overview
+                {...{
+                  data,
+                  navigate
+                }}
+              />
+            )}
+            {data && page === 'library' && (
+              <AssetLibrary
+                key={`library-${initialId}`}
+                assets={data.assets}
+                episodes={data.episodes}
+                media={data.media}
+                initialId={initialId}
+                onOpenEpisode={(id) => navigate('episodes', id)}
+                onChat={(context) => {
+                  setChatContext(context);
+                  navigate('chat');
+                }}
+                onRejected={onRejected}
+                onSaved={(a) => updateRecord('assets', a)}
+                onMedia={onMedia}
+              />
+            )}
+            {data && page === 'chat' && (
+              <ProductionChat
+                data={data}
+                initialContext={chatContext}
+                onMedia={onMedia}
+                onReview={async (target, recordId) => {
+                  try {
+                    setData(await request('/studio'));
+                    navigate(target, recordId);
+                  } catch (e) {
+                    setError(e.message);
+                  }
+                }}
+                onChanged={() => setReload((n) => n + 1)}
+              />
+            )}
+            {data && page === 'episodes' && (
+              <Episodes
+                key={`episodes-${initialId}-${createEpisode}`}
+                initialId={initialId}
+                episodes={data.episodes}
+                assets={data.assets}
+                media={data.media}
+                settings={data.settings}
+                initialCreate={createEpisode}
+                onReload={() => setReload((n) => n + 1)}
+                onSaved={(e) => updateRecord('episodes', e)}
+                onAssetSaved={(a) => updateRecord('assets', a)}
+                onChat={(context) => {
+                  setChatContext(context);
+                  navigate('chat');
+                }}
+                onRejected={onRejected}
+                onMedia={onMedia}
+              />
+            )}
+            {data && page === 'media' && (
+              <MediaLibrary media={data.media} onMedia={onMedia} onRejected={onRejected} />
+            )}
+            {data && page === 'bible' && (
+              <SeriesBible
+                settings={data.settings}
+                onSaved={(settings) =>
+                  setData((old) => ({
+                    ...old,
+                    settings
+                  }))
+                }
+              />
+            )}
+          </Suspense>
+        </Box>
+        <Box component="footer" className="studio-footer">
+          <Typography variant="caption">Roxy Kane / Independent series production</Typography>
+          <Typography variant="caption">Develop · Review · Finalize</Typography>
+        </Box>
+      </Box>
+    </Box>
   );
 }
