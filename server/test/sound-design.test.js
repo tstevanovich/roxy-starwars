@@ -14,7 +14,13 @@ import request from 'supertest';
 import { createApp } from '../src/app.js';
 import { Job } from '../src/assistant/models.js';
 import { createSoundProduction } from '../src/assistant/sound-production.js';
-import { StudioAsset, StudioEpisode, StudioMedia, StudioSettings } from '../src/models/Studio.js';
+import {
+  StudioAsset,
+  StudioEpisode,
+  StudioMedia,
+  StudioProject,
+  StudioSettings
+} from '../src/models/Studio.js';
 import { mixState, validateMixedSelection } from '../src/sound-design.js';
 import { saveGeneratedMedia } from '../src/studio-media.js';
 import { soundPlanFingerprint, soundPlanInput } from '../src/studio-validation.js';
@@ -99,6 +105,11 @@ before(
   { timeout: 180000 }
 );
 beforeEach(async () => {
+  await StudioProject.updateOne(
+    { key: 'imperial-smuggler' },
+    { $set: { key: 'imperial-smuggler', videoWorkflow: 'legacy-upscale' } },
+    { upsert: true }
+  );
   for (const model of [StudioAsset, StudioEpisode, StudioMedia, StudioSettings, Job])
     await model.deleteMany({});
   app = createApp({ auth: false, mediaDirectory: directory });
@@ -139,6 +150,7 @@ beforeEach(async () => {
                 dialogue: 'ROXY: Al, that costs extra.',
                 camera: 'Fixed.',
                 soundEffects: 'Port ambience. No music.',
+                production: { cleanDialogueMediaId: String(audio._id) },
                 takeIds: [String(source._id)]
               }
             ]
@@ -477,4 +489,61 @@ test('sound audio import needs an approved plan and creates one unapproved sound
     .post(base + '/assistant/sound/mix')
     .send({})
     .expect(401);
+});
+
+test('mixes exclude the generator soundtrack and reject missing clean speech', async () => {
+  const originalScene = episode.scenes[0];
+  const noStem = JSON.parse(JSON.stringify(originalScene));
+  noStem.clips[0].production.cleanDialogueMediaId = null;
+  await assert.rejects(
+    () => mixState(episode, noStem, noStem.clips[0], String(source._id)),
+    /dialogue-only audio stem/
+  );
+  const mixed = await renderMix();
+  assert.equal(mixed.soundMix.audioPolicy, 'isolated-dialogue-and-approved-effects-v1');
+  assert.ok(mixed.soundMix.cleanDialogueMediaId);
+  const decode = async (filename) =>
+    (
+      await execute(
+        'ffmpeg',
+        [
+          '-v',
+          'error',
+          '-i',
+          filename,
+          '-ss',
+          '0.4',
+          '-t',
+          '1',
+          '-vn',
+          '-ar',
+          '48000',
+          '-ac',
+          '1',
+          '-f',
+          'f32le',
+          '-'
+        ],
+        { encoding: 'buffer', maxBuffer: 1000000, windowsHide: true }
+      )
+    ).stdout;
+  const amplitude = (buffer, frequency) => {
+    let cosine = 0,
+      sine = 0;
+    const count = buffer.length / 4;
+    for (let i = 0; i < count; i++) {
+      const sample = buffer.readFloatLE(i * 4),
+        angle = (2 * Math.PI * frequency * i) / 48000;
+      cosine += sample * Math.cos(angle);
+      sine += sample * Math.sin(angle);
+    }
+    return Math.hypot(cosine, sine) / count;
+  };
+  const input = await decode(join(directory, source.filename)),
+    output = await decode(join(directory, mixed.filename));
+  assert.ok(
+    amplitude(output, 440) < amplitude(input, 440) * 0.02,
+    'The 440Hz generated soundtrack must be excluded.'
+  );
+  assert.ok(amplitude(output, 120) > 0.01, 'Approved dialogue/effects remain audible.');
 });

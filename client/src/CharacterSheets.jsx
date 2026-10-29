@@ -12,7 +12,9 @@ import {
 } from '@mui/material';
 import { useState } from 'react';
 
+import { turnaroundViews } from '../../shared/character-package.js';
 import { request } from './api.js';
+import { mediaUrl } from './studio-utils.js';
 import { ReferencePreview, UploadButton } from './StudioMedia.jsx';
 
 const characterViews = {
@@ -46,7 +48,7 @@ export default function CharacterSheets({
   const views = isProp ? propViews : characterViews;
   const expectedViews = isProp
     ? ['side', 'opposite-side', 'top', 'rear', 'detail']
-    : Object.keys(views);
+    : turnaroundViews;
   const [title, setTitle] = useState(`${asset.name} ${sheetName}`);
   const [mediaId, setMediaId] = useState('');
   const [selectedViews, setSelectedViews] = useState([]);
@@ -95,7 +97,7 @@ export default function CharacterSheets({
           <Typography color="text.secondary">
             {isProp
               ? 'Every prop uses a reusable reference sheet. Establish both sides, top, rear, and a detail view; add front and three-quarter views when useful. Keep proportions, markings, materials, and attachments consistent.'
-              : 'Every character and droid uses a reusable character sheet: front, three-quarter, side, rear, and face detail. Keep proportions, markings, and features consistent. Episode outfits have their own references.'}
+              : 'Body turnaround: front, three-quarter, profile and rear full-body views, with heads and feet visible. Use one character and one outfit. Review the master portrait, expressions, costume, written identity and separate useful views individually in the reference package.'}
           </Typography>
         </Box>
         {error && <Alert severity="error">{error}</Alert>}
@@ -164,7 +166,10 @@ export default function CharacterSheets({
                       Approve {sheetName}
                     </Button>
                     {file && (
-                      <Button component="a" href={`${file.url}?download=1`}>
+                      <Button
+                        component="a"
+                        href={`${mediaUrl(file._id)}${mediaUrl(file._id).includes('?') ? '&' : '?'}download=1`}
+                      >
                         Download sheet
                       </Button>
                     )}

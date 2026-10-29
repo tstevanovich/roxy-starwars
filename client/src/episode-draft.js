@@ -5,10 +5,15 @@ const textFields = (value, names) =>
 function editable(episode) {
   return {
     ...textFields(episode, ['title', 'synopsis', 'premise', 'notes']),
+    production: episode.production ?? {},
+    sourceReferences: episode.sourceReferences ?? [],
+    decisions: episode.decisions ?? [],
     scenes: (episode.scenes ?? []).map((scene) => ({
       id: scene.id,
-      ...textFields(scene, ['title', 'style', 'location', 'script']),
+      ...textFields(scene, ['title', 'style', 'location', 'script', 'sourceNotes']),
       assetIds: scene.assetIds ?? [],
+      sourceReferenceIds: scene.sourceReferenceIds ?? [],
+      production: scene.production ?? {},
       soundPlan: scene.soundPlan
         ? {
             notes: scene.soundPlan.notes,
@@ -23,7 +28,8 @@ function editable(episode) {
         takeIds: clip.takeIds ?? [],
         dialogueTakeIds: clip.dialogueTakeIds ?? [],
         selectedTakeId: clip.selectedTakeId ?? null,
-        selectedDialogueId: clip.selectedDialogueId ?? null
+        selectedDialogueId: clip.selectedDialogueId ?? null,
+        production: clip.production ?? {}
       }))
     }))
   };
@@ -32,6 +38,7 @@ function editable(episode) {
 // Only merge user-editable fields. Approvals, upscale requests and revisions come
 // from the saved record, and the server still validates the resulting save.
 export function reconcileEpisodeDraft(local, latest, prefer) {
+  const newVideoPass = Boolean(latest.videoPass?.id && latest.videoPass.id !== local.videoPass?.id);
   const base = latest.history?.find((entry) => entry.revision === local.revision);
   if (!base)
     return {
@@ -46,12 +53,30 @@ export function reconcileEpisodeDraft(local, latest, prefer) {
   }
   function merge(before, mine, theirs, path = []) {
     const key = path.at(-1);
+    if (
+      newVideoPass &&
+      [
+        'takeIds',
+        'selectedTakeId',
+        'visualTakeId',
+        'upscaleMediaId',
+        'upscaleSourceTakeId',
+        'cleanDialogueMediaId',
+        'audioRepairTakeId'
+      ].includes(key)
+    )
+      return theirs;
     if (key === 'takeIds' || key === 'dialogueTakeIds')
       return [...new Set([...(theirs ?? []), ...(mine ?? [])])];
     if (equal(mine, before)) return theirs;
     if (equal(theirs, before) || equal(mine, theirs)) return mine;
     if (
-      (key === 'scenes' || key === 'clips' || key === 'layers') &&
+      (key === 'scenes' ||
+        key === 'clips' ||
+        key === 'layers' ||
+        key === 'items' ||
+        key === 'sourceReferences' ||
+        key === 'decisions') &&
       Array.isArray(mine) &&
       Array.isArray(theirs)
     ) {

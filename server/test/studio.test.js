@@ -10,7 +10,13 @@ import request from 'supertest';
 
 import { createApp } from '../src/app.js';
 import { connectDatabase } from '../src/db.js';
-import { StudioAsset, StudioEpisode, StudioMedia, StudioSettings } from '../src/models/Studio.js';
+import {
+  StudioAsset,
+  StudioEpisode,
+  StudioMedia,
+  StudioProject,
+  StudioSettings
+} from '../src/models/Studio.js';
 import { upscaleForSelection } from '../src/studio-upscale.js';
 import { episodeView } from '../src/studio-validation.js';
 
@@ -47,6 +53,11 @@ before(
   { timeout: 180000 }
 );
 beforeEach(async () => {
+  await StudioProject.updateOne(
+    { key: 'imperial-smuggler' },
+    { $set: { key: 'imperial-smuggler', videoWorkflow: 'legacy-upscale' } },
+    { upsert: true }
+  );
   await Promise.all([
     StudioAsset.deleteMany({}),
     StudioEpisode.deleteMany({}),

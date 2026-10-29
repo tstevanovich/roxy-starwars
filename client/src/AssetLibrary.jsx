@@ -20,6 +20,8 @@ import { useState } from 'react';
 
 import { request } from './api.js';
 import CharacterSheets from './CharacterSheets.jsx';
+import ProductionBoard, { EnableWorkflow } from './ProductionBoard.jsx';
+import { AssetProductionInputs } from './ProductionInputs.jsx';
 import ShotImageReview from './ShotImageReview.jsx';
 import {
   assetStatus,
@@ -42,7 +44,9 @@ export function AssetEditor({
   onBack,
   onOpenAsset,
   onChat,
-  onRejected
+  onRejected,
+  workflowVersion = 0,
+  onReload
 }) {
   const { draft, dirty, edit, saved, reloadSaved, newerSavedVersion } = useDraft(
     asset,
@@ -186,7 +190,8 @@ export function AssetEditor({
         <Stack
           direction="row"
           sx={{
-            gap: 1
+            gap: 1,
+            flexWrap: 'wrap'
           }}
         >
           <Chip
@@ -256,6 +261,41 @@ export function AssetEditor({
           Organization changes preserve approved references.
         </Alert>
       )}
+      {draft.identitySourceMediaIds?.length > 0 && (
+        <Box className="editor-panel">
+          <Typography variant="h2">Roxy identity reference</Typography>
+          <Typography>
+            Preserve the approved face, hair and proportions. Episode wardrobe and weapons are
+            separate choices.
+          </Typography>
+          {draft.identitySourceMediaIds.map((id) => (
+            <ReferencePreview key={id} file={media.find((file) => file._id === id)} />
+          ))}
+        </Box>
+      )}
+      {!draft.clipId && workflowVersion === 1 && (
+        <>
+          <ProductionBoard
+            onChanged={onReload}
+            record={asset}
+            scope="asset"
+            media={media}
+            assets={assets}
+            saving={busy}
+            draftPending={dirty}
+          />
+          <AssetProductionInputs
+            asset={draft}
+            media={media}
+            onEdit={(production) => field('production', production)}
+            onMedia={onMedia}
+            onChat={onChat}
+            onRejected={onRejected}
+            disabled={busy || dirty}
+          />
+        </>
+      )}
+      {workflowVersion !== 1 && <EnableWorkflow disabled={busy || dirty} />}
       {['character', 'droid', 'prop'].includes(draft.kind) && (
         <CharacterSheets
           asset={dirty ? asset : draft}
@@ -719,7 +759,9 @@ export default function AssetLibrary({
   initialId,
   onOpenEpisode,
   onChat,
-  onRejected
+  onRejected,
+  workflowVersion = 0,
+  onReload
 }) {
   const [selected, setSelected] = useState(initialId || '');
   const [category, setCategory] = useState('all');
@@ -775,6 +817,8 @@ export default function AssetLibrary({
   if (asset)
     return (
       <AssetEditor
+        onReload={onReload}
+        workflowVersion={workflowVersion}
         onChat={onChat}
         key={asset._id}
         asset={asset}

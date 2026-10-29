@@ -1,5 +1,5 @@
 import { ThemeProvider } from '@mui/material/styles';
-import { render, screen, within } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, test, vi } from 'vitest';
 
@@ -18,14 +18,20 @@ const episode = {
   revision: 7
 };
 const settings = { targetSeconds: 600, vlogPercent: 33 };
-function mount(record = episode, onSaved = vi.fn(), media = [], onRejected = vi.fn()) {
+function mount(
+  record = episode,
+  onSaved = vi.fn(),
+  media = [],
+  onRejected = vi.fn(),
+  configuration = settings
+) {
   return render(
     <ThemeProvider theme={theme}>
       <Episodes
         episodes={[record]}
         assets={[]}
         media={media}
-        settings={settings}
+        settings={configuration}
         onSaved={onSaved}
         onMedia={vi.fn()}
         onRejected={onRejected}
@@ -38,6 +44,98 @@ beforeEach(() => {
   vi.mocked(request).mockReset();
   vi.stubGlobal('scrollTo', vi.fn());
 });
+
+test.each(['cached', 'new'])(
+  'saved episode reviews work with %s unsaved edits without overwriting the editor',
+  async (mode) => {
+    const user = userEvent.setup();
+    const record = {
+      ...episode,
+      production: { sourceNotes: 'Saved verified source research.' },
+      sourceReferences: [],
+      decisions: []
+    };
+    const key = 'roxy-studio-episode-' + record._id;
+    if (mode === 'cached')
+      localStorage.setItem(
+        key,
+        JSON.stringify({ ...record, notes: 'Retain local episode changes.' })
+      );
+    const row = {
+      key: 'source-row',
+      target: { scope: 'episode', recordId: record._id },
+      stage: 'source',
+      title: 'Source research',
+      status: 'pending-review',
+      canApprove: true,
+      blockers: [],
+      prerequisites: [],
+      feedback: '',
+      fingerprint: 'saved-source',
+      parentRevision: 7,
+      reviewRevision: 0
+    };
+    let approved = false;
+    vi.mocked(request).mockImplementation(async (path) => {
+      if (path === '/studio/workflow/review') {
+        approved = true;
+        return { review: { state: 'approved' } };
+      }
+      return {
+        enabled: true,
+        record,
+        proposals: [],
+        groups: [
+          {
+            title: 'Episode preparation',
+            target: row.target,
+            stages: [
+              {
+                ...row,
+                status: approved ? 'approved' : row.status,
+                reviewRevision: approved ? 1 : 0
+              }
+            ]
+          }
+        ]
+      };
+    });
+    mount(record, vi.fn(), [], vi.fn(), { ...settings, workflowVersion: 1 });
+    await user.click(screen.getByRole('button', { name: 'Open episode' }));
+    if (mode === 'new') {
+      const notes = screen.getByRole('textbox', { name: 'Episode continuity notes' });
+      await user.clear(notes);
+      await user.click(notes);
+      await user.paste('Retain local episode changes.');
+    }
+    const board = screen.getByRole('region', { name: 'Production approval board' });
+    const approve = await within(board).findByRole('button', { name: 'Approve Source research' });
+    expect(approve).toBeEnabled();
+    expect(within(board).getByText('Saved verified source research.')).toBeVisible();
+    await user.click(approve);
+    expect(request).toHaveBeenCalledWith('/studio/workflow/review', {
+      method: 'POST',
+      body: {
+        target: row.target,
+        stage: 'source',
+        action: 'approve',
+        fingerprint: 'saved-source',
+        parentRevision: 7,
+        reviewRevision: 0,
+        feedback: ''
+      }
+    });
+    await waitFor(() =>
+      expect(
+        within(board).getByRole('button', { name: 'Source research Approved' })
+      ).toBeInTheDocument()
+    );
+    expect(screen.getByRole('textbox', { name: 'Episode continuity notes' })).toHaveValue(
+      'Retain local episode changes.'
+    );
+    expect(JSON.parse(localStorage.getItem(key)).notes).toBe('Retain local episode changes.');
+  }
+);
 
 test('unsaved episode edits block dialogue rejection', async () => {
   const user = userEvent.setup();
@@ -61,12 +159,32 @@ test('unsaved episode edits block dialogue rejection', async () => {
   const review = screen.getByRole('region', { name: 'Dialogue takes for Al questions the berth' });
   expect(within(review).getByLabelText('Al-eleven-v3-dialogue.mp3')).toBeInTheDocument();
   expect(within(review).getByRole('button', { name: 'Selected dialogue' })).toBeDisabled();
-  await user.type(
-    screen.getByRole('textbox', { name: 'Episode continuity notes' }),
-    ' Keep this edit.'
-  );
+  await user.click(screen.getByRole('textbox', { name: 'Episode continuity notes' }));
+  await user.paste(' Keep this edit.');
   expect(within(review).getByRole('button', { name: 'Reject & delete' })).toBeDisabled();
   expect(request).not.toHaveBeenCalled();
+});
+test('native 1080p episodes offer native import and omit the upscale controls', async () => {
+  const { base } = staleEpisodeCase(false);
+  vi.mocked(request).mockImplementation(async (path) =>
+    path.includes('/assistant/music?')
+      ? {
+          defaults: { prompt: 'Original music', bufferSeconds: 5 },
+          targetSeconds: 8,
+          jobs: [],
+          cue: null
+        }
+      : { enabled: true, record: base, groups: [] }
+  );
+  mount(base, vi.fn(), [], vi.fn(), {
+    ...settings,
+    workflowVersion: 1,
+    videoWorkflow: 'native-1080p'
+  });
+  await userEvent.click(screen.getByRole('button', { name: 'Open episode' }));
+  expect(await screen.findByLabelText('Import native 1080p video')).toBeInTheDocument();
+  expect(screen.queryByLabelText('Import 1440p video file')).not.toBeInTheDocument();
+  expect(screen.queryByText('No upscale imported for this clip')).not.toBeInTheDocument();
 });
 
 test('dialogue rejection submits the owning episode revision and clip, then refreshes media', async () => {
@@ -381,12 +499,13 @@ test('unselected takes are playable beside their clip and require an explicit se
   expect(
     within(videoReview).getByRole('heading', { name: 'Video takes to review' })
   ).toBeInTheDocument();
-  const video = within(videoReview).getByLabelText('Corellia-take01.mp4');
+  const pendingReview = screen.getByRole('region', { name: 'Pending video choices' });
+  const video = within(pendingReview).getByLabelText('Corellia-take01.mp4');
   expect(video).toHaveAttribute('src', '/api/studio/media/take-one');
   expect(video).toHaveAttribute('controls');
   expect(video).toAppearBefore(screen.getByRole('textbox', { name: 'Action and performance' }));
   expect(video).toAppearBefore(screen.getByLabelText('Corellia-dialogue.mp3'));
-  expect(within(videoReview).getByRole('button', { name: 'Approve video take' })).toBeEnabled();
+  expect(within(pendingReview).getByRole('button', { name: 'Approve video take' })).toBeEnabled();
   expect(screen.getByRole('combobox', { name: 'Selected video take' })).toHaveTextContent(
     'No take selected'
   );
@@ -537,4 +656,228 @@ test('dialogue can be played, explicitly selected and reopened without changing 
       ]
     })
   });
+});
+
+test('episode summary shows pending production reviews before any scenes exist', () => {
+  mount({ ...episode, workflowReviewCount: 1 });
+  expect(screen.getByText('Pending choice (1 production review)')).toBeVisible();
+});
+
+test('original video has picture approval and rejection together beside its top player', async () => {
+  const user = userEvent.setup(),
+    { base } = staleEpisodeCase(false),
+    onSaved = vi.fn();
+  const row = {
+    target: { scope: 'clip', recordId: base._id, sceneId: 'scene', clipId: 'clip' },
+    stage: 'visual',
+    fingerprint: 'picture-fingerprint',
+    parentRevision: 7,
+    reviewRevision: 0
+  };
+  const clip = {
+    ...base.scenes[0].clips[0],
+    takeIds: ['picture'],
+    production: { visualTakeId: null },
+    pictureApprovalStatus: 'draft',
+    pictureReview: row
+  };
+  const record = {
+    ...base,
+    workflowVersion: 1,
+    scenes: [{ ...base.scenes[0], pictureReviewBlockers: [], clips: [clip] }]
+  };
+  const next = {
+    ...record,
+    revision: 8,
+    scenes: [
+      {
+        ...record.scenes[0],
+        clips: [
+          { ...clip, production: { visualTakeId: 'picture' }, pictureApprovalStatus: 'approved' }
+        ]
+      }
+    ]
+  };
+  vi.mocked(request).mockImplementation(async (path) =>
+    path === '/studio'
+      ? { episodes: [next] }
+      : path.endsWith('/board')
+        ? { enabled: true, groups: [], nextSteps: [] }
+        : { review: { state: 'approved' } }
+  );
+  mount(
+    record,
+    onSaved,
+    [{ _id: 'picture', kind: 'video', originalName: 'orbital-redo.mp4' }],
+    vi.fn(),
+    { ...settings, workflowVersion: 1 }
+  );
+  await user.click(screen.getByRole('button', { name: 'Open episode' }));
+  const pending = screen.getByRole('region', { name: 'Pending video choices' });
+  expect(within(pending).getByRole('button', { name: 'Reject & delete' })).toBeEnabled();
+  await user.click(within(pending).getByRole('button', { name: 'Approve picture & performance' }));
+  expect(request).toHaveBeenCalledWith('/studio/workflow/review', {
+    method: 'POST',
+    body: {
+      target: row.target,
+      stage: 'visual',
+      action: 'approve',
+      takeId: 'picture',
+      fingerprint: 'picture-fingerprint',
+      parentRevision: 7,
+      reviewRevision: 0
+    }
+  });
+  expect(onSaved).toHaveBeenCalledWith(next);
+  expect(
+    await screen.findByRole('button', { name: 'Picture & performance approved' })
+  ).toBeDisabled();
+  expect(next.scenes[0].clips[0].selectedTakeId).toBeNull();
+});
+
+test('clip readiness permits picture review even when sibling shots block whole-scene reviews', async () => {
+  const user = userEvent.setup(),
+    { base } = staleEpisodeCase(false);
+  const record = {
+    ...base,
+    workflowVersion: 1,
+    scenes: [
+      {
+        ...base.scenes[0],
+        pictureReviewBlockers: ['Storyboard continuity', 'Timed animatic'],
+        clips: [{ ...base.scenes[0].clips[0], takeIds: ['picture'], pictureReviewBlockers: [] }]
+      }
+    ]
+  };
+  vi.mocked(request).mockResolvedValue({ enabled: true, groups: [], nextSteps: [] });
+  mount(record, vi.fn(), [{ _id: 'picture', kind: 'video', originalName: 'review.mp4' }], vi.fn(), {
+    ...settings,
+    workflowVersion: 1
+  });
+  await user.click(screen.getByRole('button', { name: 'Open episode' }));
+  const pending = screen.getByRole('region', { name: 'Pending video choices' });
+  expect(
+    within(pending).getByRole('button', { name: 'Approve picture & performance' })
+  ).toBeEnabled();
+  expect(within(pending).queryByText(/Complete these reviews/)).not.toBeInTheDocument();
+});
+
+test('blocked picture approval remains visible and identifies the scene reviews needed', async () => {
+  const user = userEvent.setup(),
+    { base } = staleEpisodeCase(false),
+    record = {
+      ...base,
+      workflowVersion: 1,
+      scenes: [
+        {
+          ...base.scenes[0],
+          pictureReviewBlockers: ['Shot plan', 'Timed animatic'],
+          clips: [{ ...base.scenes[0].clips[0], takeIds: ['picture'] }]
+        }
+      ]
+    };
+  vi.mocked(request).mockResolvedValue({ enabled: true, groups: [], nextSteps: [] });
+  mount(
+    record,
+    vi.fn(),
+    [{ _id: 'picture', kind: 'video', originalName: 'orbital-redo.mp4' }],
+    vi.fn(),
+    { ...settings, workflowVersion: 1 }
+  );
+  await user.click(screen.getByRole('button', { name: 'Open episode' }));
+  const pending = screen.getByRole('region', { name: 'Pending video choices' });
+  expect(
+    within(pending).getByRole('button', { name: 'Approve picture & performance' })
+  ).toBeDisabled();
+  expect(
+    within(pending).getByText(/Complete these reviews for this clip.*Shot plan, Timed animatic/)
+  ).toBeVisible();
+  expect(
+    within(pending).getByRole('link', { name: "Review this clip's prerequisites" })
+  ).toHaveAttribute('href', `#picture-prerequisites-${base.scenes[0].clips[0].id}`);
+  expect(within(pending).getByRole('button', { name: 'Reject & delete' })).toBeEnabled();
+});
+
+test('native video approval clearly accepts picture and sound in one request', async () => {
+  const user = userEvent.setup(),
+    { base } = staleEpisodeCase(false),
+    onSaved = vi.fn();
+  const row = {
+    target: { scope: 'clip', recordId: base._id, sceneId: 'scene', clipId: 'clip' },
+    stage: 'visual',
+    fingerprint: 'picture-fingerprint',
+    parentRevision: 7,
+    reviewRevision: 0
+  };
+  const clip = {
+    ...base.scenes[0].clips[0],
+    takeIds: ['picture'],
+    production: { visualTakeId: null },
+    pictureApprovalStatus: 'draft',
+    pictureReview: row
+  };
+  const record = {
+    ...base,
+    workflowVersion: 1,
+    scenes: [{ ...base.scenes[0], pictureReviewBlockers: [], clips: [clip] }]
+  };
+  const next = {
+    ...record,
+    revision: 8,
+    scenes: [
+      {
+        ...record.scenes[0],
+        clips: [
+          {
+            ...clip,
+            selectedTakeId: 'picture',
+            production: { visualTakeId: 'picture' },
+            pictureApprovalStatus: 'approved'
+          }
+        ]
+      }
+    ]
+  };
+  vi.mocked(request).mockImplementation(async (path) =>
+    path === '/studio'
+      ? { episodes: [next] }
+      : path.endsWith('/board')
+        ? { enabled: true, groups: [], nextSteps: [] }
+        : { review: { state: 'approved' } }
+  );
+  mount(
+    record,
+    onSaved,
+    [
+      {
+        _id: 'picture',
+        kind: 'video',
+        nativeAudio: { policy: 'wan-native-effects-v1' },
+        originalName: 'native-sound.mp4'
+      }
+    ],
+    vi.fn(),
+    { ...settings, workflowVersion: 1 }
+  );
+  await user.click(screen.getByRole('button', { name: 'Open episode' }));
+  const pending = screen.getByRole('region', { name: 'Pending video choices' });
+  expect(within(pending).getByRole('button', { name: 'Reject & delete' })).toBeEnabled();
+  await user.click(
+    within(pending).getByRole('button', { name: 'Approve picture, performance & sound' })
+  );
+  expect(request).toHaveBeenCalledWith('/studio/workflow/review', {
+    method: 'POST',
+    body: {
+      target: row.target,
+      stage: 'visual',
+      action: 'approve',
+      takeId: 'picture',
+      fingerprint: 'picture-fingerprint',
+      parentRevision: 7,
+      reviewRevision: 0
+    }
+  });
+  expect(onSaved).toHaveBeenCalledWith(next);
+  expect(await screen.findByRole('button', { name: 'Picture & sound approved' })).toBeDisabled();
+  expect(next.scenes[0].clips[0].selectedTakeId).toBe('picture');
 });

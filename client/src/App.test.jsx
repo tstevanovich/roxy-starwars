@@ -219,6 +219,36 @@ test('overview and library agree on combined asset and video choices without cou
   expect(await screen.findByRole('button', { name: 'Pending choice (3)' })).toBeInTheDocument();
 });
 
+test('overview counts a workflow asset once and excludes empty work still in development', async () => {
+  vi.mocked(request).mockResolvedValue({
+    ...data,
+    assets: [
+      { ...asset, workflowStatus: 'pending-choice' },
+      { ...asset, _id: 'rendering', reviewStatus: 'pending-choice', workflowStatus: 'development' }
+    ],
+    workflowReviews: [
+      {
+        key: 'source',
+        name: asset.name,
+        title: 'Source evidence',
+        status: 'pending-review',
+        target: { scope: 'asset', recordId: asset._id }
+      },
+      {
+        key: 'brief',
+        name: asset.name,
+        title: 'Creative brief',
+        status: 'needs-review',
+        target: { scope: 'asset', recordId: asset._id }
+      }
+    ]
+  });
+  mount();
+  expect(
+    within(await screen.findByRole('region', { name: 'Pending choices' })).getByText('01')
+  ).toBeInTheDocument();
+});
+
 test('an asset link opens its pending character sheet directly', async () => {
   window.history.replaceState({}, '', '/?asset=al');
   const finalizedAt = '2026-10-17T20:00:00Z';
@@ -430,4 +460,27 @@ test('creates an episode and keeps scene approval disabled until its draft is sa
   expect(duration).toHaveValue(30);
   expect(screen.getByRole('button', { name: 'Approve script' })).toBeDisabled();
   expect(screen.getByRole('button', { name: 'Save episode' })).toBeEnabled();
+});
+
+test('overview counts draft episode source research as a visible pending owner review', async () => {
+  vi.mocked(request).mockResolvedValue({
+    ...data,
+    assets: [],
+    workflowReviews: [
+      {
+        key: 'source',
+        target: { scope: 'episode', recordId: 'episode-one' },
+        name: 'Initial Sith Trials',
+        title: 'Source research',
+        stage: 'source',
+        status: 'draft'
+      }
+    ]
+  });
+  mount();
+  const pending = await screen.findByRole('region', { name: 'Pending choices' });
+  expect(within(pending).getByText('01')).toBeInTheDocument();
+  expect(
+    screen.getByRole('link', { name: /Initial Sith Trials.*Source research.*Needs your review/ })
+  ).toBeVisible();
 });

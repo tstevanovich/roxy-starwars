@@ -41,9 +41,7 @@ test('shows sheet views and sends explicit approval without editing the identity
     </ThemeProvider>
   );
   expect(screen.getByText('Awaiting review')).toBeInTheDocument();
-  expect(
-    screen.getByText(/Additional views to establish: Three-quarter, Face detail/)
-  ).toBeInTheDocument();
+  expect(screen.getByText(/Additional views to establish: Three-quarter/)).toBeInTheDocument();
   await user.click(screen.getByRole('button', { name: 'Approve character sheet' }));
   expect(request).toHaveBeenCalledWith('/studio/assets/al/character-sheets/sheet/approve', {
     method: 'POST',

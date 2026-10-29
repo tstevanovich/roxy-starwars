@@ -76,6 +76,43 @@ test('opens saved conversations and sends an idempotent contextual message', asy
   });
   await waitFor(() => expect(input).toHaveValue(''));
 });
+test('captured subtitle images display directly from the conversation without reloading the global media list', async () => {
+  HTMLElement.prototype.scrollIntoView = vi.fn();
+  const original = vi.mocked(request).getMockImplementation();
+  vi.mocked(request).mockImplementation(async (path, ...args) =>
+    path.endsWith('/chats/chat1')
+      ? {
+          chat: { _id: 'chat1', title: 'Source dialogue' },
+          messages: [
+            {
+              _id: 'capture-reply',
+              role: 'assistant',
+              text: 'Saved source evidence.',
+              mediaIds: ['subtitle']
+            }
+          ],
+          media: [
+            {
+              _id: 'subtitle',
+              kind: 'image',
+              originalName: 'SOURCE-SUBTITLE-1038.png',
+              sourceFrame: { requestedSeconds: 1038, view: 'subtitle-crop' }
+            }
+          ],
+          runs: [],
+          jobs: [],
+          proposals: []
+        }
+      : original(path, ...args)
+  );
+  mount();
+  expect(await screen.findByAltText('SOURCE-SUBTITLE-1038.png')).toHaveAttribute(
+    'src',
+    '/api/studio/media/subtitle'
+  );
+  expect(screen.getByText('Source 17:18 · Subtitle crop')).toBeVisible();
+  expect(screen.queryByText('Reference deleted')).not.toBeInTheDocument();
+});
 test('failed send retains text and retry ID across a page reopen', async () => {
   const user = userEvent.setup();
   const original = vi.mocked(request).getMockImplementation();
@@ -158,6 +195,72 @@ test('story proposals require an explicit Apply draft action', async () => {
   });
   expect(onChanged).toHaveBeenCalled();
 });
+test('draft failures remain visible beside the draft across successful background refreshes', async () => {
+  detail.proposals = [
+    {
+      _id: 'proposal1',
+      title: 'Portrait revision',
+      text: 'Correct realism.',
+      status: 'pending',
+      assetId: 'asset-one'
+    }
+  ];
+  let poll;
+  const timer = vi.spyOn(globalThis, 'setInterval').mockImplementation((fn) => {
+    poll = fn;
+    return 123;
+  });
+  const original = vi.mocked(request).getMockImplementation();
+  vi.mocked(request).mockImplementation(async (path, ...args) => {
+    if (path.endsWith('/proposal1/apply')) throw new Error('The saved asset changed.');
+    return original(path, ...args);
+  });
+  try {
+    mount();
+    await userEvent.click(await screen.findByRole('button', { name: 'Apply draft' }));
+    expect(await screen.findByText('The saved asset changed.')).toBeVisible();
+    await poll();
+    expect(screen.getByText('The saved asset changed.')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Apply draft' })).toBeEnabled();
+  } finally {
+    timer.mockRestore();
+  }
+});
+
+test('applying a revision shows saving progress and links the next actual approval', async () => {
+  detail.proposals = [
+    {
+      _id: 'proposal1',
+      title: 'Portrait revision',
+      text: 'Correct realism.',
+      status: 'pending',
+      assetId: 'asset-one'
+    }
+  ];
+  const original = vi.mocked(request).getMockImplementation();
+  let finish;
+  vi.mocked(request).mockImplementation((path, ...args) =>
+    path.endsWith('/proposal1/apply')
+      ? new Promise((resolve) => {
+          finish = resolve;
+        })
+      : original(path, ...args)
+  );
+  mount();
+  await userEvent.click(await screen.findByRole('button', { name: 'Apply draft' }));
+  expect(screen.getByRole('button', { name: 'Applying draft…' })).toBeDisabled();
+  finish({
+    applied: true,
+    nextReview: {
+      target: { scope: 'asset', recordId: 'asset-one' },
+      stage: 'reference-plan:master-portrait'
+    }
+  });
+  const link = await screen.findByRole('link', { name: 'Review revision directions' });
+  expect(link).toHaveAttribute('href', expect.stringContaining('asset=asset-one'));
+  expect(await screen.findByText(/Your revised directions are saved/)).toBeVisible();
+});
+
 test('connections use ChatGPT plan sign-in and do not offer an API key or billing fallback', async () => {
   const user = userEvent.setup();
   mount();
@@ -241,13 +344,13 @@ test('plan usage errors stay visible with saved messages and no API-key fallback
   ).not.toBeInTheDocument();
 });
 
-test('OpenArt shows secure sharing status and offers a read-only connection test', async () => {
+test('OpenArt shows provider-hosted reference delivery and offers a read-only connection test', async () => {
   const user = userEvent.setup();
   const account = structuredClone(configured);
   account.openart = {
     ...account.openart,
     connected: true,
-    referenceSharing: { ready: true, origin: 'https://studio.example.com' }
+    referenceSharing: { ready: true, source: 'OpenArt storage' }
   };
   const original = vi.mocked(request).getMockImplementation();
   vi.mocked(request).mockImplementation(async (path, options) => {
@@ -259,7 +362,9 @@ test('OpenArt shows secure sharing status and offers a read-only connection test
   mount();
   await screen.findByRole('textbox', { name: 'Message your production assistant' });
   await user.click(screen.getByRole('button', { name: 'Connections' }));
-  expect(screen.getByText(/Local PC sign-in is supported/)).toBeInTheDocument();
+  expect(
+    screen.getByText(/Reference files are uploaded to OpenArt and verified/)
+  ).toBeInTheDocument();
   await user.click(screen.getByRole('button', { name: 'Test OpenArt connection' }));
   expect(await screen.findByText('OpenArt responded successfully.')).toBeInTheDocument();
   expect(request).toHaveBeenCalledWith('/studio/assistant/connections/openart/test', {

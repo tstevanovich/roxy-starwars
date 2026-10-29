@@ -6,6 +6,7 @@ import { basename, join } from 'node:path';
 import { promisify } from 'node:util';
 
 import { StudioAsset, StudioEpisode, StudioMedia } from '../models/Studio.js';
+import { requireWorkflow, workflowEnabled } from '../production-workflow.js';
 import { approvedSoundPlan, mixState } from '../sound-design.js';
 import { mediaView, saveGeneratedMedia } from '../studio-media.js';
 import {
@@ -43,6 +44,11 @@ export function createSoundProduction({ mediaDirectory, fetcher = fetch, execute
     const episode = await StudioEpisode.findById(id(args.episodeId)).lean();
     const scene = episode?.scenes.find((s) => s.id === args.sceneId);
     if (!scene) fail('Choose a saved scene.');
+    if (workflowEnabled())
+      await requireWorkflow(
+        { scope: 'scene', recordId: String(episode._id), sceneId: scene.id },
+        'sound-plan'
+      );
     const assets = await StudioAsset.find().lean();
     approvedSoundPlan(scene, assets);
     return { episode, scene, assets };
@@ -218,9 +224,17 @@ export function createSoundProduction({ mediaDirectory, fetcher = fetch, execute
       const duration = Number(probe.format?.duration);
       if (!Number.isFinite(duration) || Math.abs(duration - clip.duration) > 0.75)
         fail('Source video duration does not match this clip.');
-      const hasDialogue = probe.streams.some((s) => s.codec_type === 'audio');
-      if (clip.dialogue.trim() && !hasDialogue)
-        fail('The speaking video has no audio track. Choose a take with synchronized dialogue.');
+      const hasDialogue = Boolean(state.cleanDialogue);
+      if (hasDialogue) {
+        const dialogueProbe = await inspect(state.cleanDialogue);
+        if (
+          !dialogueProbe.streams.some((s) => s.codec_type === 'audio') ||
+          Math.abs(Number(dialogueProbe.format?.duration) - duration) > 0.15
+        )
+          fail(
+            'The clean dialogue stem must match the video duration, including silence, to preserve synchronization.'
+          );
+      }
       const directory = await mkdtemp(join(tmpdir(), 'roxy-sound-mix-'));
       try {
         const filters = [];
@@ -287,7 +301,7 @@ export function createSoundProduction({ mediaDirectory, fetcher = fetch, execute
           { windowsHide: true, timeout: 120000, maxBuffer: 100000 }
         );
         const base = hasDialogue
-          ? `[0:a]volume=${scene.soundPlan.dialogueGainDb ?? 0}dB[dialogue]`
+          ? `[2:a]volume=${scene.soundPlan.dialogueGainDb ?? 0}dB[dialogue]`
           : `anullsrc=r=48000:cl=stereo,atrim=duration=${duration}[dialogue]`;
         await executeFile(
           process.env.FFMPEG_PATH || 'ffmpeg',
@@ -299,6 +313,7 @@ export function createSoundProduction({ mediaDirectory, fetcher = fetch, execute
             path(state.source),
             '-i',
             stemPath,
+            ...(hasDialogue ? ['-i', path(state.cleanDialogue)] : []),
             '-filter_complex',
             `${base};[dialogue][1:a]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95:level=0:latency=1[mix]`,
             '-map',
@@ -336,13 +351,19 @@ export function createSoundProduction({ mediaDirectory, fetcher = fetch, execute
             `mixed-${job._id}.mp4`,
             {
               productionJobId: String(job._id),
+              videoVerification: state.source.videoVerification
+                ? { ...state.source.videoVerification, audio: true }
+                : undefined,
               soundMix: {
+                audioPolicy: 'isolated-dialogue-and-approved-effects-v1',
+                cleanDialogueMediaId: state.cleanDialogue ? String(state.cleanDialogue._id) : null,
                 sourceTakeId: String(state.source._id),
                 stemMediaId: String(stem._id),
                 episodeId: String(episode._id),
                 sceneId: scene.id,
                 clipId: clip.id,
                 fingerprint: state.fingerprint,
+                inputFingerprint: state.inputFingerprint,
                 createdAt: new Date().toISOString()
               }
             }

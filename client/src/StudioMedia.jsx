@@ -3,7 +3,17 @@ import CloudUploadOutlined from '@mui/icons-material/CloudUploadOutlined';
 import ImageOutlined from '@mui/icons-material/ImageOutlined';
 import RocketLaunchOutlined from '@mui/icons-material/RocketLaunchOutlined';
 import SmartToyOutlined from '@mui/icons-material/SmartToyOutlined';
-import { Alert, Box, Button, Chip, MenuItem, Stack, TextField, Typography } from '@mui/material';
+import {
+  Alert,
+  Box,
+  Button,
+  Chip,
+  CircularProgress,
+  MenuItem,
+  Stack,
+  TextField,
+  Typography
+} from '@mui/material';
 import { useState } from 'react';
 
 import { uploadMedia } from './api.js';
@@ -81,16 +91,24 @@ export function ReferencePreview({ file, kind = 'image', compact = false }) {
     </Box>
   );
 }
-export function UploadButton({ onUploaded, label = 'Upload reference', disabled = false }) {
+export function UploadButton({
+  onUploaded,
+  label = 'Upload reference',
+  disabled = false,
+  multiple = true,
+  accept = '.png,.jpg,.jpeg,.webp,.gif,.mp4,.webm,.mp3,.wav,.m4a,.ogg',
+  busyLabel = 'Saving local files…'
+}) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   async function upload(event) {
     const files = [...event.target.files];
     event.target.value = '';
+    if (!files.length) return;
     setBusy(true);
     setError('');
     try {
-      for (const file of files) onUploaded(await uploadMedia(file));
+      for (const file of files) await onUploaded(await uploadMedia(file));
     } catch (e) {
       setError(e.message);
     } finally {
@@ -102,18 +120,17 @@ export function UploadButton({ onUploaded, label = 'Upload reference', disabled 
       <Button
         component="label"
         variant="outlined"
-        startIcon={<CloudUploadOutlined />}
+        startIcon={busy ? <CircularProgress size={18} /> : <CloudUploadOutlined />}
         disabled={busy || disabled}
       >
-        {busy ? 'Saving local files…' : label}
-        <input
-          type="file"
-          hidden
-          multiple
-          accept=".png,.jpg,.jpeg,.webp,.gif,.mp4,.webm,.mp3,.wav,.m4a,.ogg"
-          onChange={upload}
-        />
+        {busy ? busyLabel : label}
+        <input type="file" hidden multiple={multiple} accept={accept} onChange={upload} />
       </Button>
+      {busy && (
+        <Typography role="status" variant="body2">
+          {busyLabel} Keep this page open until saving finishes.
+        </Typography>
+      )}
       {error && <Alert severity="error">{error}</Alert>}
     </Stack>
   );
@@ -286,7 +303,11 @@ export default function MediaLibrary({ media, onMedia, onRejected }) {
                 <Typography variant="caption">
                   {file.kind} · {(file.bytes / 1048576).toFixed(1)} MB
                 </Typography>
-                <Button component="a" href={`${mediaUrl(file._id)}?download=1`} size="small">
+                <Button
+                  component="a"
+                  href={`${mediaUrl(file._id)}${mediaUrl(file._id).includes('?') ? '&' : '?'}download=1`}
+                  size="small"
+                >
                   Download original
                 </Button>
                 {['image', 'video', 'audio'].includes(file.kind) && (

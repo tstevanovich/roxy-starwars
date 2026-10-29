@@ -1,5 +1,15 @@
 import ArrowBackOutlined from '@mui/icons-material/ArrowBackOutlined';
-import { Alert, Box, Button, Chip, Stack, Typography } from '@mui/material';
+import {
+  Accordion,
+  AccordionDetails,
+  AccordionSummary,
+  Alert,
+  Box,
+  Button,
+  Chip,
+  Stack,
+  Typography
+} from '@mui/material';
 import { useState } from 'react';
 
 import { request } from './api.js';
@@ -89,6 +99,34 @@ export default function ShotImageReview({ asset, media, onSaved, onRejected, onB
             <ReferencePreview file={file} />
             <Stack spacing={2} sx={{ p: 2 }}>
               <Typography variant="h3">{candidate.title}</Typography>
+              {candidate.continuitySources?.length > 0 && (
+                <>
+                  <Alert severity="info">
+                    Check this option against the approved earlier shots: same ship, platform,
+                    background landmarks and metal walkway; only the requested camera/action may
+                    change. Approve image applies only to this new option.
+                  </Alert>
+                  <Accordion>
+                    <AccordionSummary>Earlier approved images — reference only</AccordionSummary>
+                    <AccordionDetails>
+                      <Box
+                        sx={{
+                          display: 'grid',
+                          gridTemplateColumns: { xs: '1fr', md: '1fr 1fr' },
+                          gap: 2
+                        }}
+                      >
+                        {candidate.continuitySources.map((s) => (
+                          <Box key={s.mediaId}>
+                            <Typography>{s.title} · reference only</Typography>
+                            <ReferencePreview file={media.find((m) => m._id === s.mediaId)} />
+                          </Box>
+                        ))}
+                      </Box>
+                    </AccordionDetails>
+                  </Accordion>
+                </>
+              )}
               <Typography variant="body2" sx={{ whiteSpace: 'pre-line' }}>
                 {candidate.description}
               </Typography>

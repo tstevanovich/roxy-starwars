@@ -95,3 +95,29 @@ test('an invalid multi-image shot option cannot be approved as a bundle', () => 
   expect(screen.getByRole('button', { name: 'Approve image' })).toBeDisabled();
   expect(screen.getByRole('alert')).toHaveTextContent('must contain one image');
 });
+
+test('continuity references are clearly marked comparison-only and approval still targets just one new image', async () => {
+  const user = userEvent.setup();
+  vi.mocked(request).mockResolvedValue({ asset });
+  mount({
+    asset: {
+      ...asset,
+      candidates: [
+        {
+          ...asset.candidates[1],
+          continuitySources: [{ mediaId: 'one', title: 'Earlier parked ship' }]
+        }
+      ]
+    }
+  });
+  expect(screen.getAllByRole('button', { name: 'Approve image' })).toHaveLength(1);
+  await user.click(
+    screen.getByRole('button', { name: 'Earlier approved images — reference only' })
+  );
+  expect(screen.getByText('Earlier parked ship · reference only')).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Approve image' }));
+  expect(request).toHaveBeenCalledWith('/studio/assets/shot/finalize', {
+    method: 'POST',
+    body: { revision: 3, candidateId: 'b' }
+  });
+});

@@ -54,10 +54,10 @@ export default function SeriesBible({ settings, onSaved }) {
         </Alert>
       )}
       {notice && <Alert severity="success">{notice}</Alert>}
-      <Alert severity="warning">
-        Approved video takes request a 1440p (2K) upscale automatically when saved. Originals are
-        retained. Processing is waiting for an OpenArt connection that supports video upscaling; the
-        app does not currently submit or charge for these requests.
+      <Alert severity="info">
+        New videos use Wan 3.0 Standard at native 1080p, 16:9. Approve picture, performance and
+        sound together, then use the approved file directly in CapCut. No upscale step is required.
+        Existing approved high-resolution files remain available.
       </Alert>
       <Alert severity="info">
         Every character, droid, and prop uses a reusable reference sheet. Characters and droids need
@@ -90,6 +90,7 @@ export default function SeriesBible({ settings, onSaved }) {
             />
             <TextField
               label="Vlog target percentage"
+              disabled={settings.cinematicOnly}
               type="number"
               fullWidth
               value={draft.vlogPercent}
@@ -128,7 +129,7 @@ export default function SeriesBible({ settings, onSaved }) {
       <Box className="pipeline-grid">
         {[
           ['Images', imageGenerationDefaults.displayName, '2K · high quality · all image assets'],
-          ['Video', 'Wan 3.0', '16:9 · 480p review · scene-led duration'],
+          ['Video', 'Wan 3.0', '16:9 · native 1080p · scene-led duration'],
           ['Voices', 'ElevenLabs', 'Reusable voices · original dialogue masters'],
           ['Final edit', 'CapCut', 'Selected clips · music added in the edit']
         ].map(([label, name, detail]) => (

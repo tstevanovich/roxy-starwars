@@ -181,9 +181,10 @@ export default function SoundDesign({
         />
       </Stack>
       <Typography variant="body2">
-        Plan the ambience and timed effects with the scene. Approve individual sounds, then create
-        and review a finished mix before approving the video. Original dialogue stays synchronized.
-        Music is added in CapCut.
+        Plan ambience and timed effects before rendering. Wan generates them with the picture;
+        approve a good picture and soundtrack together in the video player. The tools below are
+        optional repairs for missing effects, unwanted music or poor audio. Music is added in
+        CapCut.
       </Typography>
       {error && <Alert severity="error">{error}</Alert>}
       {notice && <Alert severity="info">{notice}</Alert>}
@@ -215,12 +216,12 @@ export default function SoundDesign({
             onChange={(e) => edit({ notes: e.target.value })}
           />
           <TextField
-            label="Original video audio level (dB)"
+            label="Clean dialogue level (dB)"
             type="number"
             value={plan.dialogueGainDb}
             onChange={(e) => edit({ dialogueGainDb: Number(e.target.value) })}
             slotProps={{ htmlInput: { min: -30, max: 6, step: 1 } }}
-            helperText="0 dB preserves the source dialogue level. Effects are mixed underneath."
+            helperText="Applies only to the separate dialogue-only stem. Provider soundtracks are excluded."
           />
           {plan.layers.map((layer, index) => {
             const asset = assets.find((a) => a._id === layer.assetId);
@@ -463,6 +464,7 @@ export default function SoundDesign({
           </Button>
           <Button
             variant="contained"
+            sx={episode.workflowVersion === 1 ? { display: 'none' } : undefined}
             disabled={
               !ready || approved || scene.approvalStatus !== 'approved' || !plan.layers.length
             }
@@ -475,18 +477,19 @@ export default function SoundDesign({
               Approve the scene script to approve its sound plan together.
             </Typography>
           )}
-          <Typography variant="h3">Create finished video mixes</Typography>
+          <Typography variant="h3">Repair audio with a replacement mix</Typography>
           <Typography variant="body2">
-            Select an original take for each clip. Mixing is local and retains the original video
-            and dialogue. A separate effects stem is saved for CapCut. Review and approve the mixed
-            video in that clip below.
+            Select an original picture take for each clip. Mixing preserves its video and uses only
+            approved effects and a separate clean dialogue stem when speaking. It excludes the
+            provider soundtrack. A separate effects stem is saved for CapCut. Review the finished
+            mix.
           </Typography>
           {scene.clips.map((clip) => (
             <Stack key={clip.id} spacing={1}>
               <TextField
                 select
                 label={`Original take: ${clip.title}`}
-                value={sources[clip.id] || ''}
+                value={sources[clip.id] || clip.production?.visualTakeId || ''}
                 slotProps={{ inputLabel: { shrink: true }, select: { displayEmpty: true } }}
                 onChange={(e) => setSources({ ...sources, [clip.id]: e.target.value })}
               >
@@ -505,8 +508,18 @@ export default function SoundDesign({
                   ))}
               </TextField>
               <Button
-                disabled={!ready || !approved || !sources[clip.id]}
-                onClick={() => run('mix', { clipId: clip.id, sourceTakeId: sources[clip.id] })}
+                disabled={
+                  !ready ||
+                  !approved ||
+                  !(sources[clip.id] || clip.production?.visualTakeId) ||
+                  (Boolean(clip.dialogue?.trim()) && !clip.production?.cleanDialogueMediaId)
+                }
+                onClick={() =>
+                  run('mix', {
+                    clipId: clip.id,
+                    sourceTakeId: sources[clip.id] || clip.production?.visualTakeId
+                  })
+                }
               >
                 Create sound mix - {clip.title}
               </Button>

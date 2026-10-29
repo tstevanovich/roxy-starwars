@@ -8,12 +8,38 @@ import { fail } from '../studio-validation.js';
 
 const endpoint = new URL('https://mcp.openart.ai/mcp');
 export function unpack(result) {
-  if (result.isError)
-    fail(
-      'OpenArt rejected the request: ' +
-        (result.content?.find((x) => x.type === 'text')?.text ?? 'Provider error.'),
-      502
+  if (result.isError) {
+    const message = result.content?.find((x) => x.type === 'text')?.text ?? 'Provider error.';
+    let details = result.structuredContent;
+    if (!details) {
+      try {
+        details = JSON.parse(message);
+      } catch {
+        /* Not every provider error is structured. */
+      }
+    }
+    const rejected = details?.status === 'FAILED' && details.historyId === 'submit-failed';
+    throw Object.assign(
+      new Error(
+        rejected
+          ? `OpenArt rejected this render (${details.errorDisplayCode ?? details.failedCode ?? 'provider error'}). No render ID was issued. Review the failure before requesting a retry.`
+          : 'OpenArt rejected the request: ' + message
+      ),
+      {
+        status: 502,
+        ...(rejected
+          ? {
+              providerRejection: {
+                status: details.status,
+                error: details.error,
+                failedCode: details.failedCode,
+                errorDisplayCode: details.errorDisplayCode
+              }
+            }
+          : {})
+      }
     );
+  }
   if (result.structuredContent) return result.structuredContent;
   for (const item of result.content ?? []) {
     if (item.type === 'text') {

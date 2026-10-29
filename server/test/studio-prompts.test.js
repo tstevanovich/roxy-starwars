@@ -1,7 +1,86 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import {
+  imageRevisionReview,
+  packageImagePrompt,
+  visualImageDirections
+} from '../../shared/asset-image-prompts.js';
 import { clipPrompts, productionVideoPrompt } from '../src/studio-prompts.js';
+
+test('package image prompts exclude asset biographies, research and other deliverables', () => {
+  const asset = {
+    kind: 'character',
+    brief:
+      'UNFINALIZED workflow. Four-panel turnaround, expression sheet. Voice audition uses Eleven v3. Credits 176.',
+    notes: 'OWNER APPROVAL REQUIRED',
+    production: {
+      sourceNotes: 'SOURCE TRANSCRIPT 17:03. https://youtube.com/video',
+      items: [{ id: 'master-portrait', mediaId: 'approved-master' }]
+    }
+  };
+  const item = {
+    id: 'view-front',
+    title: 'Individual full-body front view',
+    notes:
+      'One full-body FRONT view including head and feet. Red tunic and black trousers. Plain gray background.'
+  };
+  const prompt = packageImagePrompt(asset, item, { era: 'Old Republic era' });
+  assert.match(prompt, /Star Wars universe, Old Republic era/);
+  assert.match(prompt, /full-body FRONT/);
+  assert.match(prompt, /Red tunic and black trousers/);
+  assert.match(prompt, /first reference is the approved master portrait/);
+  for (const phrase of [
+    'UNFINALIZED',
+    'Four-panel',
+    'expression sheet',
+    'Eleven',
+    'Credits',
+    'OWNER',
+    'SOURCE TRANSCRIPT',
+    'https://',
+    '17:03'
+  ])
+    assert.ok(!prompt.includes(phrase), phrase);
+});
+
+test('exact approved image prompts are returned whole without planning additions', () => {
+  const prompt =
+    'Star Wars universe, Old Republic era. One realistic front view, exact approved costume. No labels.';
+  const item = {
+    id: 'view-front',
+    title: 'Front',
+    imagePrompt: prompt,
+    notes: 'Owner approval, costs and unrelated voice work.'
+  };
+  assert.equal(
+    packageImagePrompt({ kind: 'character', brief: 'Entire production package' }, item),
+    prompt
+  );
+  assert.ok(
+    visualImageDirections(
+      'Write pronunciation notes for ElevenLabs. Red cloth with a silver buckle. Approval is pending. No readable text.'
+    ).includes('Red cloth with a silver buckle.')
+  );
+  assert.ok(!visualImageDirections(item.notes).includes('approval'));
+});
+
+test('changing only an exact image prompt requires revision review without changing other item fields', () => {
+  const before = {
+    id: 'front',
+    type: 'image',
+    notes: 'Keep source design.',
+    imagePrompt: 'Old visual prompt.',
+    mediaId: 'image'
+  };
+  const next = { ...before, imagePrompt: 'New visual prompt.' };
+  assert.deepEqual(imageRevisionReview(before, next), {
+    ...next,
+    requiresPlanApproval: true,
+    revisionSourceMediaId: 'image'
+  });
+  assert.equal(imageRevisionReview(before, before), before);
+});
 
 test('every image and video prompt carries Star Wars era guidance even without asset references', () => {
   const scenes = [
@@ -94,7 +173,7 @@ test('each clip keeps its own instructions without copying other dialogue or ass
   }
   assert.deepEqual(
     result.referenceMediaIds,
-    assets.map((a) => a.finalChoice.mediaIds[0])
+    assets.filter((a) => a.kind !== 'voice').map((a) => a.finalChoice.mediaIds[0])
   );
   assert.equal(result.dialogueMediaId, 'selected-al');
   assert.deepEqual({ scene, clip, assets }, before);
@@ -135,5 +214,55 @@ test('production video prompts preserve exact shot instructions without appendin
   assert.match(prompt, /Star Wars universe, Imperial era/);
   assert.match(prompt, /No conventional cars or wheeled vehicles/);
   assert.match(prompt, /No music, score/);
+  assert.ok(prompt.endsWith('Music is added later in CapCut.'));
   assert.ok(prompt.length < 4500);
+});
+
+test('orbital shots use their own setting and exclude offscreen platform references', async () => {
+  const { runProjectContext } = await import('../src/project-context.js');
+  runProjectContext({ key: 'test', era: 'Old Republic era', workflowVersion: 1 }, () => {
+    const assets = [
+      {
+        _id: 'fleet',
+        name: 'Sith orbital fleet',
+        kind: 'ship',
+        finalChoice: { mediaIds: ['fleet-image'] }
+      },
+      {
+        _id: 'platform',
+        name: 'Surface landing platform reference',
+        kind: 'environment',
+        finalChoice: { mediaIds: ['platform-image'] }
+      }
+    ];
+    const scene = {
+      title: 'Orbital approach and landing',
+      style: 'cinematic',
+      location: 'Korriban orbit and Academy landing platform',
+      assetIds: ['fleet', 'platform']
+    };
+    const clip = {
+      title: 'Orbital fleet',
+      duration: 12,
+      action: 'Fleet in orbit above Korriban.',
+      dialogue: '',
+      camera: 'Hold extreme wide.',
+      production: {
+        location: 'Korriban orbit, exterior vacuum',
+        environment: 'space-exterior',
+        physicalConstraints:
+          'Hold this exact orbital vista for the entire clip; no foreground reveal.',
+        referenceMediaIds: ['fleet-image']
+      }
+    };
+    const prompts = clipPrompts(scene, clip, assets),
+      video = productionVideoPrompt(scene, clip);
+    assert.ok(!prompts.image.includes('Surface landing platform reference'));
+    for (const prompt of [prompts.image, prompts.video, video]) {
+      assert.ok(!prompt.includes('LOCATION: ' + scene.location));
+      assert.ok(prompt.includes('LOCATION: Korriban orbit, exterior vacuum'));
+      assert.match(prompt, /No landing platform, ground plane, road, cars/);
+      assert.match(prompt, /coherent trajectories and scale/);
+    }
+  });
 });

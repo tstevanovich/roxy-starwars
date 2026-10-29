@@ -1,5 +1,5 @@
 import { ThemeProvider } from '@mui/material/styles';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, test, vi } from 'vitest';
 
@@ -33,6 +33,140 @@ beforeEach(() => {
   localStorage.clear();
 });
 
+test.each(['character', 'droid', 'prop', 'environment'])(
+  'saved %s revision approvals work with an older browser draft and retain all local edits',
+  async (kind) => {
+    const user = userEvent.setup();
+    const asset = {
+      ...base,
+      _id: 'package-asset',
+      kind,
+      revision: 6,
+      candidates: [],
+      production: {
+        managed: true,
+        items: [
+          {
+            id: 'master-portrait',
+            title: 'Master portrait',
+            type: 'image',
+            required: true,
+            notes: 'Saved revised photographic directions.',
+            mediaId: null,
+            requiresPlanApproval: true
+          }
+        ]
+      }
+    };
+    const cached = {
+      ...asset,
+      revision: 4,
+      notes: 'Keep these unsaved continuity edits.',
+      production: {
+        ...asset.production,
+        items: asset.production.items.map((i) => ({ ...i, notes: 'Outdated draft directions.' }))
+      }
+    };
+    const key = 'roxy-studio-asset-package-asset';
+    localStorage.setItem(key, JSON.stringify(cached));
+    const row = {
+      key: 'reference-plan-key',
+      target: { scope: 'asset', recordId: asset._id },
+      stage: 'reference-plan:master-portrait',
+      title: 'Master portrait revision directions',
+      status: 'pending-review',
+      canApprove: true,
+      blockers: [],
+      prerequisites: [],
+      feedback: '',
+      fingerprint: 'saved-directions-fingerprint',
+      parentRevision: 6,
+      reviewRevision: 0
+    };
+    let approved = false;
+    vi.mocked(request).mockImplementation(async (path) => {
+      if (path === '/studio/workflow/review') {
+        approved = true;
+        return { review: { state: 'approved' } };
+      }
+      if (path === '/studio/workflow/board')
+        return {
+          enabled: true,
+          record: asset,
+          proposals: [],
+          groups: [
+            {
+              title: 'Reference package',
+              target: row.target,
+              stages: [
+                {
+                  ...row,
+                  status: approved ? 'approved' : row.status,
+                  reviewRevision: approved ? 1 : 0
+                }
+              ]
+            }
+          ]
+        };
+      return {};
+    });
+    const onReload = vi.fn();
+    mount(
+      <AssetEditor
+        asset={asset}
+        assets={[asset]}
+        media={[]}
+        workflowVersion={1}
+        onSaved={vi.fn()}
+        onMedia={vi.fn()}
+        onBack={vi.fn()}
+        onReload={onReload}
+      />
+    );
+    await user.click(
+      await screen.findByRole('button', {
+        name: 'Master portrait revision directions Pending review'
+      })
+    );
+    const board = screen.getByRole('region', { name: 'Production approval board' });
+    expect(within(board).getByText('Saved revised photographic directions.')).toBeVisible();
+    expect(within(board).queryByText('Outdated draft directions.')).not.toBeInTheDocument();
+    expect(within(board).getByText(/unsaved editor draft is preserved separately/)).toBeVisible();
+    const approve = within(board).getByRole('button', {
+      name: 'Approve Master portrait revision directions'
+    });
+    expect(approve).toBeEnabled();
+    await user.click(approve);
+    expect(request).toHaveBeenCalledWith('/studio/workflow/review', {
+      method: 'POST',
+      body: {
+        target: row.target,
+        stage: row.stage,
+        action: 'approve',
+        fingerprint: row.fingerprint,
+        parentRevision: 6,
+        reviewRevision: 0,
+        feedback: ''
+      }
+    });
+    await waitFor(() =>
+      expect(
+        within(board).getByRole('button', { name: 'Master portrait revision directions Approved' })
+      ).toBeInTheDocument()
+    );
+    expect(screen.getByRole('textbox', { name: 'Continuity notes' })).toHaveValue(cached.notes);
+    expect(JSON.parse(localStorage.getItem(key))).toMatchObject({
+      revision: 4,
+      notes: cached.notes,
+      production: cached.production
+    });
+    expect(onReload).toHaveBeenCalled();
+    expect(
+      vi.mocked(request).mock.calls.every(([path]) => path !== '/studio/assets/package-asset')
+    ).toBe(true);
+  }
+);
+
 test('three review states distinguish unfinished work, decisions, and finalized choices', () => {
   expect(assetStatus({ candidates: [] })).toBe('development');
   expect(assetStatus(base)).toBe('pending-choice');
@@ -40,6 +174,14 @@ test('three review states distinguish unfinished work, decisions, and finalized 
   expect(
     assetStatus({ ...base, finalChoice: base.candidates[0], reviewStatus: 'pending-choice' })
   ).toBe('pending-choice');
+});
+
+test('workflow review state overrides a stale stored pending label while rendering', () => {
+  expect(
+    assetStatus({ ...base, reviewStatus: 'pending-choice', workflowStatus: 'development' })
+  ).toBe('development');
+  expect(assetStatus({ ...base, workflowStatus: 'pending-choice' })).toBe('pending-choice');
+  expect(assetStatus({ ...base, workflowStatus: 'finalized' })).toBe('finalized');
 });
 
 test('a finalized ElevenLabs audition can be rejected from its owning voice option', async () => {

@@ -1,16 +1,24 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { packageImagePrompt } from '../../../shared/asset-image-prompts.js';
+import { nativeAudioPolicy } from '../../../shared/audio-policy.js';
+import { videoGenerationDefaults } from '../../../shared/production-defaults.js';
+import { proposalApplication } from '../../../shared/production-proposals.js';
 import { StudioAsset, StudioEpisode, StudioMedia } from '../models/Studio.js';
-import { hashToken, readOwner } from '../owner.js';
+import { imageWorkflow, shotWorkflow, workflowEnabled } from '../production-workflow.js';
+import { activeProject, legacyProjectKey, projectEra } from '../project-context.js';
+import { assertMediaAccess, withProject } from '../projects.js';
 import { approvedSoundPlan } from '../sound-design.js';
 import { saveGeneratedMedia } from '../studio-media.js';
 import { clipPrompts, productionVideoPrompt } from '../studio-prompts.js';
 import { fail, id, sceneFingerprint, text } from '../studio-validation.js';
-import { Job, SourceGrant } from './models.js';
-import { referenceSharing } from './reference-sharing.js';
+import { Job, Proposal, SourceGrant } from './models.js';
+import { createMusicProduction } from './music-production.js';
+import { createReferenceStorage } from './reference-storage.js';
+import { assertNoPendingRevision } from './render-revisions.js';
 import { createSoundProduction } from './sound-production.js';
 
 export const defaultMediaDirectory = fileURLToPath(
@@ -39,14 +47,25 @@ export function speakerVoice(clip, assets) {
     fail('Finalize this speaker’s Eleven v3 voice first.');
   return { voice, spokenText: match[2].replace(/\bAL\b/g, 'Al') };
 }
-export async function renderTarget(target, kind) {
+export async function renderTarget(target, kind, revisionProposalId) {
   const assets = await StudioAsset.find({ archived: { $ne: true } }).lean();
   if (target.episodeId) {
+    if (kind === 'video') await assertNoPendingRevision(target, revisionProposalId);
     const episode = await StudioEpisode.findById(id(target.episodeId)).lean();
     const scene = episode?.scenes.find((s) => s.id === target.sceneId);
     const clip = scene?.clips.find((c) => c.id === target.clipId);
     if (!clip) fail('Choose an existing episode, scene and clip.');
-    if (!scene.approval || scene.approval.fingerprint !== sceneFingerprint(scene, assets))
+    if (
+      activeProject()?.faithfulAdaptation &&
+      !episode.sourceReferences?.some(
+        (ref) => ref.status === 'verified' && scene.sourceReferenceIds?.includes(ref.id)
+      )
+    )
+      fail('Review and verify the linked source chapter before requesting production assets.');
+    if (
+      !workflowEnabled() &&
+      (!scene.approval || scene.approval.fingerprint !== sceneFingerprint(scene, assets))
+    )
       fail('Approve the current scene script before requesting production assets.');
     const linked = assets.filter((a) => scene.assetIds.map(String).includes(String(a._id)));
     if (linked.some((a) => !a.finalChoice || a.reviewStatus === 'pending-choice'))
@@ -78,12 +97,24 @@ export async function renderTarget(target, kind) {
     if (kind === 'video' && clip.dialogue?.trim() && !clip.selectedDialogueId)
       fail('Choose the ElevenLabs dialogue performance before generating video.');
     if (kind === 'video') approvedSoundPlan(scene, assets);
-    const prompts = clipPrompts(scene, clip, assets);
+    const prompts = clipPrompts(scene, clip, assets, episode);
+    if (kind === 'image' && prompts.continuity.errors.length)
+      fail(prompts.continuity.errors.join(' '), 409);
     const snapshot = {
+      ...(workflowEnabled() ? { workflow: await shotWorkflow(episode, scene, kind, clip) } : {}),
       fingerprint: sceneFingerprint(scene, assets),
       imageIds,
       dialogueId: clip.selectedDialogueId ? String(clip.selectedDialogueId) : null
     };
+    if (kind === 'image' && prompts.continuity.sources.length)
+      snapshot.continuity = {
+        sources: prompts.continuity.sources,
+        notes: prompts.continuity.notes
+      };
+    if (kind === 'video') {
+      snapshot.audioPolicy = nativeAudioPolicy;
+      if (episode.videoPass?.id) snapshot.videoPassId = episode.videoPass.id;
+    }
     const speaker = kind === 'dialogue' ? speakerVoice(clip, assets) : null;
     if (speaker) snapshot.voice = speaker.voice.finalChoice;
     return { episode, scene, clip, shot, assets, prompts, snapshot, speaker };
@@ -92,7 +123,23 @@ export async function renderTarget(target, kind) {
   const asset = assets.find((a) => String(a._id) === id(target.assetId));
   if (!asset) fail('Choose an existing creative-library asset.');
   if (['voice', 'sound'].includes(asset.kind)) fail('Choose a visual asset for image generation.');
-  return { asset, assets, snapshot: { revision: asset.revision, finalChoice: asset.finalChoice } };
+  const workflow = await imageWorkflow(asset, target.packageItemId);
+  return {
+    asset,
+    assets,
+    snapshot: target.packageItemId
+      ? {
+          workflow,
+          item: asset.production.items.find((item) => item.id === target.packageItemId),
+          identitySourceMediaIds: asset.identitySourceMediaIds,
+          sourceMediaIds: asset.production.sourceMediaIds
+        }
+      : {
+          revision: asset.revision,
+          finalChoice: asset.finalChoice,
+          ...(workflow ? { workflow } : {})
+        }
+  };
 }
 
 // Read provenance only for a media hash that is still in the live library. Rejected files are never restored.
@@ -129,39 +176,19 @@ export function createProduction({
   openart,
   store,
   mediaDirectory = defaultMediaDirectory,
-  ownerPath,
-  remotePath,
   fetcher = fetch
 }) {
   const sound = createSoundProduction({ mediaDirectory, fetcher });
+  const music = createMusicProduction({ mediaDirectory, fetcher });
+  const references = createReferenceStorage({ openart, store, mediaDirectory, fetcher });
   async function reference(mediaId, job) {
+    await assertMediaAccess([mediaId]);
     const media = await StudioMedia.findById(id(mediaId)).lean();
     if (!media) fail('A required reference was deleted. Choose a replacement.');
     const known = media.providerReference ?? (await referenceIndex()).get(media.sha256);
-    if (known) return { type: media.kind, id: known.id, url: known.url, label: media.originalName };
-    const secrets = await store.read();
-    const sharing = await referenceSharing({
-      redirectUrl: secrets.openart?.redirectUrl,
-      remotePath
-    });
-    if (!sharing.ready) fail(sharing.message);
-    const origin = sharing.origin;
-    const token = randomBytes(32).toString('base64url');
-    const owner = await readOwner(ownerPath);
-    if (!owner?.version) fail('Set up the studio owner before sharing references.');
-    await SourceGrant.create({
-      tokenHash: hashToken(token),
-      mediaId: String(media._id),
-      ownerVersion: owner?.version,
-      expires: new Date(Date.now() + 3600000),
-      jobId: String(job._id)
-    });
-    return {
-      type: media.kind,
-      id: String(media._id),
-      url: origin + '/api/assistant/source/' + token,
-      label: media.originalName
-    };
+    if (known?.id && /^https:\/\/cdn\.openart\.ai\//.test(known.url))
+      return { ...known, type: media.kind, label: media.originalName };
+    return references.reference(mediaId, job.kind === 'video' ? 'create-video' : 'create-image');
   }
   function videoPrompt(state, instructions) {
     const prompt = productionVideoPrompt(state.scene, state.clip, instructions);
@@ -175,6 +202,8 @@ export function createProduction({
     chatId,
     runId,
     requestId,
+    retryOf,
+    revisionProposalId,
     kind,
     target,
     instructions = '',
@@ -187,7 +216,9 @@ export function createProduction({
     referenceIds.forEach(id);
     const previous = await Job.findOne({ requestId }).lean();
     if (previous) return previous;
-    const state = await renderTarget(target, kind);
+    const state = await renderTarget(target, kind, revisionProposalId);
+    if (kind === 'video')
+      await validateRevision({ target, instructions, referenceIds, revisionProposalId }, state);
     if (kind === 'video') videoPrompt(state, instructions);
     const secrets = await store.read();
     if (kind !== 'dialogue' && !secrets.openart?.tokens)
@@ -201,18 +232,21 @@ export function createProduction({
         chatId,
         runId,
         requestId,
+        ...(retryOf ? { retryOf } : {}),
+        ...(revisionProposalId ? { revisionProposalId } : {}),
         kind,
         target,
         instructions,
         referenceIds,
-        title: `${kind === 'dialogue' ? 'Dialogue' : kind === 'image' ? 'Image' : 'Video'} · ${state.clip?.title ?? state.asset.name}`,
+        title: `${kind === 'dialogue' ? 'Dialogue' : kind === 'image' ? 'Image' : 'Video'} · ${state.clip?.title ?? state.asset.name}${target.packageItemId ? ' · ' + state.asset.production.items.find((i) => i.id === target.packageItemId).title : ''}`,
         snapshot: state.snapshot,
         status: 'queued'
       })
     ).toObject();
   }
   async function build(job) {
-    const state = await renderTarget(job.target, job.kind);
+    const state = await renderTarget(job.target, job.kind, job.revisionProposalId);
+    if (job.kind === 'video') await validateRevision(job, state);
     if (digest(state.snapshot) !== digest(job.snapshot))
       fail(
         'Creative choices changed after this request. Request a new render using the latest approvals.'
@@ -227,7 +261,32 @@ export function createProduction({
     else
       refs = [
         ...new Set([
+          ...(job.target.packageItemId &&
+          job.target.packageItemId !== 'master-portrait' &&
+          ['character', 'droid'].includes(state.asset?.kind)
+            ? [
+                state.asset.production.items.find((i) => i.id === 'master-portrait')?.mediaId
+              ].filter(Boolean)
+            : []),
+          ...(state.prompts?.continuity?.mediaIds ?? []),
           ...refs,
+          ...(job.target.packageItemId &&
+          job.target.packageItemId !== 'master-portrait' &&
+          ['character', 'droid'].includes(state.asset?.kind) &&
+          state.asset.production.items.some((i) => i.id === 'master-portrait' && i.mediaId)
+            ? []
+            : (state.asset?.identitySourceMediaIds?.map(String) ?? [])),
+          ...(state.asset?.production?.items?.find((i) => i.id === job.target.packageItemId)
+            ?.referenceMediaIds?.length
+            ? state.asset.production.items.find((i) => i.id === job.target.packageItemId)
+                .referenceMediaIds
+            : workflowEnabled()
+              ? state.asset?.production?.items?.find((i) => i.id === job.target.packageItemId)
+                  ?.sourceMediaIds?.length
+                ? state.asset.production.items.find((i) => i.id === job.target.packageItemId)
+                    .sourceMediaIds
+                : (state.asset?.production?.sourceMediaIds ?? [])
+              : []),
           ...(state.prompts?.referenceMediaIds ??
             state.asset.finalChoice?.mediaIds?.map(String) ??
             [])
@@ -235,18 +294,52 @@ export function createProduction({
       ];
     if (refs.length > 16)
       fail('Too many image references; select fewer references for this request.');
+    if (
+      job.kind === 'image' &&
+      (await StudioMedia.exists({ _id: { $in: refs }, kind: { $ne: 'image' } }))
+    )
+      fail('Image generation accepts image references only. Choose the approved image views.');
     let prompt =
       job.kind === 'video'
         ? videoPrompt(state, job.instructions)
-        : (state.prompts?.[job.kind] ??
-          `Star Wars universe, Imperial era. Photorealistic live-action reference. ${state.asset.name}: ${state.asset.brief}. ${state.asset.notes ?? ''}`);
+        : job.target.packageItemId
+          ? ''
+          : (state.prompts?.[job.kind] ??
+            `Star Wars universe, ${projectEra()}. Photorealistic live-action reference. ${state.asset.name}: ${state.asset.brief}. ${state.asset.notes ?? ''}`);
     if (
       job.kind === 'image' &&
-      ['character', 'droid', 'prop', 'wardrobe'].includes(state.asset?.kind)
+      ['character', 'droid', 'prop', 'wardrobe'].includes(state.asset?.kind) &&
+      !job.target.packageItemId
     )
       prompt +=
-        '\nCreate a coherent multiview reference sheet: front, three-quarter, side, rear and face/detail close-up. Consistent design across every view. No labels, text or captions. Natural skin or realistic mechanical materials.';
-    if (job.kind !== 'video') prompt += '\nREQUESTED CHANGES: ' + job.instructions;
+        state.asset.kind === 'prop'
+          ? '\nCreate a coherent multiview PROP SHEET: both sides, top, rear, grip and blade/emitter details with consistent scale. Consistent design across views. No labels, text or captions.'
+          : '\nCreate a production BODY TURNAROUND: the same single character in complete front, three-quarter, side profile and rear full-body views, heads and feet visible in every view. One character and one outfit, consistent face, hair, proportions, clothing and materials. Neutral standing poses, hands visible, plain light-gray background and even lighting. No inset portraits, readable text, labels or scenery. Clothing must follow the reviewed source or an explicitly approved wardrobe brief; never invent an interim costume.';
+    if (job.kind !== 'video' && !job.target.packageItemId)
+      prompt += '\nREQUESTED CHANGES: ' + job.instructions;
+    if (
+      job.kind === 'image' &&
+      !job.target.packageItemId &&
+      workflowEnabled() &&
+      state.asset?.production?.sourceNotes
+    )
+      prompt += '\nREVIEWED SOURCE OBSERVATIONS: ' + state.asset.production.sourceNotes;
+    if (job.target.packageItemId) {
+      const item = state.asset.production.items.find((i) => i.id === job.target.packageItemId);
+      if (
+        item.imagePrompt?.trim() &&
+        job.instructions?.trim() &&
+        job.instructions.trim() !== item.imagePrompt.trim()
+      )
+        fail(
+          'Revise and approve the saved image prompt before adding different render instructions.',
+          409
+        );
+      prompt = packageImagePrompt(state.asset, item, {
+        era: projectEra(),
+        instructions: job.instructions
+      });
+    }
     const visualReferences = await Promise.all(refs.map((mid) => reference(mid, job)));
     if (job.kind === 'image')
       return {
@@ -270,7 +363,7 @@ export function createProduction({
     const params = {
       prompt,
       videoCount: 1,
-      resolution: '480p',
+      resolution: videoGenerationDefaults.resolution,
       duration: state.clip.duration,
       mode: 'standard',
       audio: true,
@@ -329,6 +422,36 @@ export function createProduction({
       );
     if (job.kind === 'image') {
       let asset = state.asset ?? state.shot;
+      if (job.target.packageItemId) {
+        const items = asset.production.items.map((item) =>
+          item.id === job.target.packageItemId ? { ...item, mediaId: String(media._id) } : item
+        );
+        const result = await StudioAsset.updateOne(
+          { _id: asset._id, revision: asset.revision },
+          { $set: { 'production.items': items }, $inc: { revision: 1 } }
+        );
+        if (!result.modifiedCount)
+          fail('Reference package changed. Image retained in Media library.');
+        if (job.target.packageItemId === 'body-turnaround')
+          await StudioAsset.updateOne(
+            { _id: asset._id },
+            {
+              $push: {
+                candidates: {
+                  id: `chat-${job._id}`,
+                  title: 'Production body turnaround - front, three-quarter, profile, rear',
+                  description:
+                    'Complete full body including head and feet in every view. Review the other package items individually.',
+                  mediaIds: [media._id],
+                  archived: false
+                }
+              },
+              $set: { reviewStatus: 'pending-choice' }
+            }
+          );
+        await Job.updateOne({ _id: job._id }, { $set: { resultAssetId: String(asset._id) } });
+        return;
+      }
       if (!asset)
         asset = (
           await StudioAsset.create({
@@ -352,6 +475,8 @@ export function createProduction({
         description: job.instructions,
         mediaIds: [media._id]
       };
+      if (state.prompts?.continuity?.sources.length)
+        option.continuitySources = state.prompts.continuity.sources;
       if (asset.candidates?.some((c) => c.id === option.id)) {
         await Job.updateOne({ _id: job._id }, { $set: { resultAssetId: String(asset._id) } });
         return;
@@ -404,6 +529,12 @@ export function createProduction({
         `chat-${job._id}${extension}`,
         {
           productionJobId: String(job._id),
+          ...(job.kind === 'video' && job.snapshot?.audioPolicy === nativeAudioPolicy
+            ? {
+                nativeAudio: { policy: nativeAudioPolicy, ...job.target },
+                videoReview: { state: 'pending', ...job.target }
+              }
+            : {}),
           providerReference: {
             id: resource.id,
             type: job.kind,
@@ -469,6 +600,10 @@ export function createProduction({
     await Job.updateOne({ _id: job._id }, { $set: { status: 'ready' } });
   }
   async function processJob(job) {
+    return withProject(job.projectKey ?? legacyProjectKey, () => processJobInProject(job));
+  }
+  async function processJobInProject(job) {
+    if (job.kind === 'music') return music.processJob(job);
     if (['sound', 'mix'].includes(job.kind)) return sound.processJob(job);
     try {
       if (job.status === 'queued') {
@@ -483,37 +618,18 @@ export function createProduction({
           return;
         }
         const { model, mode, params } = request;
-        // Confirm the tunnel serves the exact expiring files before spending provider credits.
+        // References must be accepted into provider storage before any quote or generation.
         const references =
           params.visualReferences ?? (params.startFrame ? [params.startFrame] : []);
-        await Promise.all(
-          references
-            .filter((ref) => new URL(ref.url).pathname.startsWith('/api/assistant/source/'))
-            .map(async (ref) => {
-              try {
-                const response = await fetcher(ref.url, {
-                  method: 'HEAD',
-                  redirect: 'error',
-                  signal: AbortSignal.timeout(15000)
-                });
-                if (
-                  !response.ok ||
-                  !response.headers.get('content-type')?.startsWith(ref.type + '/')
-                )
-                  throw new Error('Reference is not reachable');
-              } catch {
-                fail(
-                  'The secure studio reference URL could not be reached. Check the remote tunnel; no render was submitted.'
-                );
-              }
-            })
-        );
+        if (references.some((ref) => !/^https:\/\/cdn\.openart\.ai\//.test(ref.url)))
+          fail('A reference has not been accepted into OpenArt storage; no render was submitted.');
         await openart.call('openart_model_form_get', { model, mode });
         const quote = await openart.call('openart_model_cost', { model, mode, params });
         if (!quote.items?.length || quote.items.some((item) => item.affordable === false))
           fail('OpenArt cannot fund this render. Check your OpenArt credit balance.');
         // No automatic retry beyond this boundary: provider might have accepted a request whose response was lost.
-        const current = await renderTarget(job.target, job.kind);
+        const current = await renderTarget(job.target, job.kind, job.revisionProposalId);
+        if (job.kind === 'video') await validateRevision(job, current);
         if (digest(current.snapshot) !== digest(job.snapshot))
           fail(
             'Creative choices changed during preparation. Request a new render using the latest approvals.'
@@ -552,13 +668,15 @@ export function createProduction({
         await importResult(job, resource);
       } else if (job.status === 'rendering') {
         const receipt = await openart.call('openart_creation_get', { historyId: job.historyId });
-        if (receipt.status === 'FAILED' || receipt.status === 'CANCELLED')
+        if (receipt.status === 'FAILED' || receipt.status === 'CANCELLED') {
+          await Job.updateOne({ _id: job._id }, { $set: { receipt } });
           fail(
             'OpenArt render ' +
               receipt.status.toLowerCase() +
               ': ' +
               (receipt.error ?? 'Check provider history.')
           );
+        }
         await Job.updateOne(
           { _id: job._id },
           {
@@ -595,7 +713,9 @@ export function createProduction({
         { _id: job._id },
         {
           $set: {
-            status: current?.status === 'submitting' ? 'uncertain' : 'failed',
+            status:
+              current?.status === 'submitting' && !error.providerRejection ? 'uncertain' : 'failed',
+            ...(error.providerRejection ? { receipt: error.providerRejection } : {}),
             error: error.status
               ? error.message.slice(0, 1500)
               : 'Provider connection failed. Check Connections and the provider history before retrying.'
@@ -604,5 +724,82 @@ export function createProduction({
       );
     }
   }
-  return { queue, processJob, build, sound };
+  async function validateRevision(job, state) {
+    if (!job.revisionProposalId) {
+      if (workflowEnabled() && (job.instructions?.trim() || state.clip.takeIds?.length))
+        fail('Approve the video revision directions before requesting a replacement render.', 409);
+      return;
+    }
+    const proposal = await Proposal.findById(id(job.revisionProposalId)).lean();
+    if (
+      !proposal?.render?.approvedAt ||
+      !['approving', 'applied'].includes(proposal.status) ||
+      digest(proposal.render.target) !== digest(job.target) ||
+      proposal.render.instructions !== job.instructions ||
+      digest(proposal.render.referenceIds ?? []) !== digest(job.referenceIds ?? []) ||
+      digest(proposal.render.approvedSnapshot) !== digest(state.snapshot)
+    )
+      fail(
+        'The video revision approval is missing or its inputs changed. Review a current revision before rendering.',
+        409
+      );
+  }
+  async function approveRevision(proposalId) {
+    const proposal = await Proposal.findById(id(proposalId)).lean();
+    if (!proposal?.render) fail('Video revision not found.', 404);
+    const requestId = `approved-video-revision-${proposal._id}`;
+    const existing = await Job.findOne({ requestId }).lean();
+    if (existing) return existing;
+    if (proposal.status !== 'pending') fail('This video revision is no longer pending.', 409);
+    if (proposal.render.resolution !== videoGenerationDefaults.resolution)
+      fail(
+        'This video revision uses older output settings. Prepare a fresh native 1080p revision before generating.',
+        409
+      );
+    const episode = await StudioEpisode.findById(proposal.episodeId).lean();
+    const application = proposalApplication(proposal, episode);
+    if (!application.canApply) fail(application.reason, 409);
+    const state = await renderTarget(proposal.render.target, 'video', String(proposal._id));
+    videoPrompt(state, proposal.render.instructions);
+    const claimed = await Proposal.updateOne(
+      { _id: proposal._id, status: 'pending', updatedAt: proposal.updatedAt },
+      {
+        $set: {
+          status: 'approving',
+          'render.approvedAt': new Date(),
+          'render.approvedSnapshot': state.snapshot
+        }
+      }
+    );
+    if (!claimed.modifiedCount) fail('This revision changed or is already being approved.', 409);
+    try {
+      const job = await queue({
+        chatId: proposal.chatId,
+        requestId,
+        kind: 'video',
+        target: proposal.render.target,
+        instructions: proposal.render.instructions,
+        referenceIds: proposal.render.referenceIds,
+        revisionProposalId: String(proposal._id)
+      });
+      await Proposal.updateOne(
+        { _id: proposal._id, status: 'approving' },
+        {
+          $set: { status: 'applied', 'render.jobId': String(job._id) }
+        }
+      );
+      return job;
+    } catch (error) {
+      if (!(await Job.exists({ requestId })))
+        await Proposal.updateOne(
+          { _id: proposal._id, status: 'approving' },
+          {
+            $set: { status: 'pending' },
+            $unset: { 'render.approvedAt': '', 'render.approvedSnapshot': '' }
+          }
+        );
+      throw error;
+    }
+  }
+  return { queue, processJob, build, sound, music, approveRevision };
 }

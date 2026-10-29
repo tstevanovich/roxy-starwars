@@ -3,16 +3,40 @@ import { fileURLToPath } from 'node:url';
 
 import { json, Router } from 'express';
 
+import { imageRevisionReview } from '../../../shared/asset-image-prompts.js';
+import {
+  addCharacterPackage,
+  characterPackageLayout,
+  turnaroundViews
+} from '../../../shared/character-package.js';
 import {
   imageGenerationDefaults,
+  noVideoUpscale,
+  videoGenerationDefaults,
   videoUpscaleDefaults
 } from '../../../shared/production-defaults.js';
+import {
+  mergeAssetProduction,
+  proposalApplication,
+  proposalBlocksReview
+} from '../../../shared/production-proposals.js';
+import { Proposal } from '../assistant/models.js';
 import {
   approvedCharacterSheets,
   characterSheetInput,
   currentCharacterSheet
 } from '../character-sheets.js';
-import { StudioAsset, StudioEpisode, StudioMedia, StudioSettings } from '../models/Studio.js';
+import {
+  StudioAsset,
+  StudioEpisode,
+  StudioMedia,
+  StudioProject,
+  StudioSettings
+} from '../models/Studio.js';
+import { musicState } from '../music-state.js';
+import { requireWorkflow, workflowContext, workflowEnabled } from '../production-workflow.js';
+import { activeProject, projectFilter, settingsKey } from '../project-context.js';
+import { assertMediaAccess, legacyProfile } from '../projects.js';
 import { validateMixedSelection } from '../sound-design.js';
 import { mediaRouter, mediaView } from '../studio-media.js';
 import { clipPrompts } from '../studio-prompts.js';
@@ -34,10 +58,14 @@ import {
   text
 } from '../studio-validation.js';
 import { sendZip } from '../studio-zip.js';
+import { deliveryMediaId, nativeVideoWorkflow, videoReviewStages } from '../video-policy.js';
+import { workflowAssetStatus } from '../workflow-automation.js';
+import { workflowRouter } from '../workflow-routes.js';
 
 const defaultMediaDirectory = fileURLToPath(new URL('../../../.data/media/', import.meta.url));
 async function referencedMedia(ids, kind) {
   const unique = [...new Set(ids.map(String))];
+  await assertMediaAccess(unique);
   const media = await StudioMedia.find({ _id: { $in: unique } }).lean();
   if (media.length !== unique.length || (kind && media.some((file) => file.kind !== kind)))
     fail(`Choose saved ${kind ?? 'reference'} files from the media library.`);
@@ -109,10 +137,22 @@ async function validateEpisodeReferences(episode, episodeId) {
   await referencedMedia(
     episode.scenes.flatMap((scene) =>
       scene.clips.flatMap((clip) =>
-        [...(clip.dialogueTakeIds ?? []), clip.selectedDialogueId].filter(Boolean)
+        [
+          ...(clip.dialogueTakeIds ?? []),
+          clip.selectedDialogueId,
+          clip.production?.cleanDialogueMediaId
+        ].filter(Boolean)
       )
     ),
     'audio'
+  );
+  await referencedMedia(
+    episode.scenes.flatMap((scene) =>
+      scene.clips.flatMap((clip) =>
+        [clip.production?.visualTakeId, clip.production?.upscaleMediaId].filter(Boolean)
+      )
+    ),
+    'video'
   );
 }
 async function validateOrganization(fields, assetId) {
@@ -155,19 +195,229 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
   const router = Router();
   router.use('/media', mediaRouter(mediaDirectory));
   router.use(json({ limit: '2mb' }));
+  router.use('/workflow', workflowRouter(mediaDirectory));
   router.get('/', async (_req, res) => {
     await seedStudio();
     const [assets, episodes, media, settings] = await Promise.all([
       StudioAsset.find().sort({ createdAt: 1 }).lean(),
       StudioEpisode.find().sort({ createdAt: -1 }).lean(),
-      StudioMedia.find().sort({ createdAt: -1 }).lean(),
-      StudioSettings.findOne({ key: 'series' }).lean()
+      StudioMedia.find({
+        $or: [
+          projectFilter(),
+          {
+            _id: {
+              $in: (await StudioAsset.find().lean()).flatMap((a) => a.identitySourceMediaIds ?? [])
+            }
+          }
+        ]
+      })
+        .sort({ createdAt: -1 })
+        .lean(),
+      StudioSettings.findOne({ key: settingsKey() }).lean()
     ]);
+    const workflow = workflowEnabled() ? await workflowContext() : null;
+    const workflowRows = workflow
+      ? [
+          ...assets
+            .filter((a) => !a.archived && !a.clipId && a.production?.managed)
+            .flatMap((a) =>
+              [
+                'source',
+                'brief',
+                ...(a.production?.items ?? []).map((i) => 'reference:' + i.id)
+              ].map((stage) => ({
+                ...workflow.evaluate({ scope: 'asset', recordId: String(a._id) }, stage),
+                name: a.name
+              }))
+            ),
+          ...episodes.flatMap((e) => [
+            ...['source', 'outline', 'export'].map((stage) => ({
+              ...workflow.evaluate({ scope: 'episode', recordId: String(e._id) }, stage),
+              name: e.title
+            })),
+            ...e.scenes.flatMap((s) => [
+              ...['script', 'shot-plan', 'sound-plan'].map((stage) => ({
+                ...workflow.evaluate(
+                  { scope: 'scene', recordId: String(e._id), sceneId: s.id },
+                  stage
+                ),
+                name: e.title + ' / ' + s.title
+              })),
+              ...['music-plan', 'music']
+                .filter(() =>
+                  workflow.musicCues.some(
+                    (c) => c.enabled && String(c.episodeId) === String(e._id) && c.sceneId === s.id
+                  )
+                )
+                .map((stage) => ({
+                  ...workflow.evaluate(
+                    { scope: 'scene', recordId: String(e._id), sceneId: s.id },
+                    stage
+                  ),
+                  name: e.title + ' / ' + s.title
+                })),
+              ...s.clips.flatMap((c) =>
+                videoReviewStages().map((stage) => ({
+                  ...workflow.evaluate(
+                    { scope: 'clip', recordId: String(e._id), sceneId: s.id, clipId: c.id },
+                    stage
+                  ),
+                  name: e.title + ' / ' + c.title
+                }))
+              )
+            ])
+          ])
+        ]
+      : [];
+    // A source that needs verification is still work for the owner. Do not hide
+    // the first incomplete preparation step just because it cannot be approved yet.
+    const nextPreparation = new Set(
+      episodes.map(
+        (e) =>
+          workflowRows.find(
+            (row) =>
+              row.target.scope === 'episode' &&
+              row.target.recordId === String(e._id) &&
+              ['source', 'outline'].includes(row.stage) &&
+              row.status !== 'approved'
+          )?.key
+      )
+    );
+    for (const episode of episodes) {
+      if (
+        workflow?.evaluate({ scope: 'episode', recordId: String(episode._id) }, 'outline')
+          .status !== 'approved'
+      )
+        continue;
+      for (const scene of episode.scenes) {
+        const next = workflowRows.find(
+          (row) =>
+            row.target.scope === 'scene' &&
+            row.target.recordId === String(episode._id) &&
+            row.target.sceneId === scene.id &&
+            ['script', 'shot-plan', 'sound-plan'].includes(row.stage) &&
+            row.status !== 'approved'
+        );
+        if (next) nextPreparation.add(next.key);
+      }
+    }
+    const workflowReviews = workflowRows.filter((row) => {
+      if (
+        row.stage === 'music' &&
+        row.status !== 'approved' &&
+        workflow.evaluate(row.target, 'music-plan').status === 'approved'
+      ) {
+        const { parent, scene } = workflow.locate(row.target);
+        if (
+          workflow.musicCues.some(
+            (c) =>
+              c.enabled &&
+              String(c.episodeId) === row.target.recordId &&
+              c.sceneId === scene.id &&
+              c.candidates.some(
+                (o) => o.qc?.passed && o.fingerprint === musicState(parent, scene, c).fingerprint
+              )
+          )
+        )
+          return true;
+      }
+      return (
+        (row.canApprove && ['pending-review', 'needs-review'].includes(row.status)) ||
+        row.status === 'needs-changes' ||
+        nextPreparation.has(row.key)
+      );
+    });
+    if (workflow) {
+      const proposals = await Proposal.find({
+        status: 'pending',
+        episodeId: { $in: episodes.map((e) => String(e._id)) }
+      }).lean();
+      for (const proposal of proposals.filter(
+        (proposal) =>
+          proposalApplication(
+            proposal,
+            episodes.find((episode) => String(episode._id) === proposal.episodeId)
+          ).canApply
+      )) {
+        const record = episodes.find((e) => String(e._id) === proposal.episodeId);
+        // Applying a replacement is one task; do not also count the saved stage
+        // that cannot be approved until this draft is applied or dismissed.
+        for (let i = workflowReviews.length - 1; i >= 0; i--) {
+          const row = workflowReviews[i];
+          if (
+            row.target.recordId === proposal.episodeId &&
+            row.target.sceneId === proposal.scene?.id &&
+            proposalBlocksReview(proposal, row.stage, record, row.target)
+          )
+            workflowReviews.splice(i, 1);
+        }
+        workflowReviews.push({
+          key: 'proposal-' + proposal._id,
+          target: { scope: 'episode', recordId: proposal.episodeId },
+          title: proposal.title,
+          name: episodes.find((e) => String(e._id) === proposal.episodeId)?.title,
+          stage: 'story-draft',
+          status: 'pending-review',
+          chatId: String(proposal.chatId)
+        });
+      }
+    }
     res.json({
-      assets,
+      workflowReviews,
+      projects: [
+        legacyProfile,
+        ...(await StudioProject.find().lean()).filter((p) => p.key !== legacyProfile.key)
+      ],
+      project: activeProject(),
+      assets: assets.map((asset) =>
+        workflow && asset.production?.managed && !asset.clipId
+          ? { ...asset, workflowStatus: workflowAssetStatus(asset, workflow) }
+          : asset
+      ),
       episodes: await Promise.all(
         episodes.map(async (e) => {
           const view = episodeView(e, assets);
+          if (workflow) {
+            view.workflowVersion = 1;
+            view.workflowReviewCount = workflowReviews.filter(
+              (row) => row.target.scope !== 'asset' && row.target.recordId === String(e._id)
+            ).length;
+            view.workflowReady =
+              workflow.evaluate({ scope: 'episode', recordId: String(e._id) }, 'export').status ===
+              'approved';
+            for (const s of view.scenes) {
+              const target = { scope: 'scene', recordId: String(e._id), sceneId: s.id };
+              s.approvalStatus = workflow.evaluate(target, 'script').status;
+              s.soundApprovalStatus = workflow.evaluate(target, 'sound-plan').status;
+              s.pictureReviewBlockers = [
+                'script',
+                'references',
+                'shot-plan',
+                'storyboard',
+                'animatic',
+                'sound-plan'
+              ]
+                .map((stage) => workflow.evaluate(target, stage))
+                .filter((row) => row.status !== 'approved')
+                .map((row) => row.title);
+              for (const clip of s.clips) {
+                const clipTarget = { ...target, scope: 'clip', clipId: clip.id };
+                clip.pictureReviewBlockers = [
+                  ...['script', 'references', 'shot-plan', 'sound-plan'].map((stage) =>
+                    workflow.evaluate(target, stage)
+                  ),
+                  ...['storyboard', 'animatic'].map((stage) => workflow.evaluate(clipTarget, stage))
+                ]
+                  .filter((row) => row.status !== 'approved')
+                  .map((row) => row.title);
+                clip.pictureReview = workflow.evaluate(clipTarget, 'visual');
+                if (!nativeVideoWorkflow())
+                  clip.upscaleReview = workflow.evaluate(clipTarget, 'upscale');
+                clip.pictureApprovalStatus = clip.pictureReview.status;
+                if (clip.pictureApprovalStatus === 'approved') clip.pictureReviewBlockers = [];
+              }
+            }
+          }
           for (const scene of view.scenes)
             for (const clip of scene.clips) {
               if (!clip.selectedTakeId) continue;
@@ -185,13 +435,36 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
         })
       ),
       media: media.map(mediaView),
-      settings
+      settings: settings
+        ? {
+            ...settings,
+            workflowVersion: activeProject()?.workflowVersion ?? 0,
+            videoWorkflow: activeProject()?.videoWorkflow ?? 'legacy-upscale',
+            cinematicOnly: Boolean(activeProject()?.cinematicOnly)
+          }
+        : settings
     });
   });
   router.post('/assets', async (req, res) => {
     const fields = assetInput(req.body);
+    if (workflowEnabled() && !fields.clipId) fields.production.managed = true;
+    if (['character', 'droid'].includes(fields.kind)) {
+      fields.sheetLayout = characterPackageLayout;
+      if (workflowEnabled()) fields.production.items = addCharacterPackage(fields.production.items);
+    }
+    await referencedMedia([
+      ...(fields.production.sourceMediaIds ?? []),
+      ...fields.production.items
+        .flatMap((item) => [item.mediaId, ...(item.referenceMediaIds ?? [])])
+        .filter(Boolean)
+    ]);
     await validateOrganization(fields);
     await referencedMedia(fields.candidates.flatMap((c) => c.mediaIds));
+    if (
+      activeProject()?.referenceLayout &&
+      ['character', 'droid', 'wardrobe'].includes(fields.kind)
+    )
+      fields.sheetLayout = characterPackageLayout;
     const asset = await StudioAsset.create(fields);
     res.status(201).json({ asset: asset.toObject() });
   });
@@ -199,12 +472,47 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
     object(req.body);
     const old = await existing(StudioAsset, req.params.id, req.body.revision);
     const fields = assetInput(req.body);
+    if (req.body.production === undefined) fields.production = old.production ?? {};
+    else if (workflowEnabled()) fields.production.managed = true;
+    if (workflowEnabled() && req.body.production !== undefined) {
+      fields.production = mergeAssetProduction(
+        {
+          production: fields.production,
+          baseRevision: old.revision,
+          baseProduction: old.production ?? {}
+        },
+        { ...old, production: old.production ?? {} }
+      );
+      const context = await workflowContext();
+      if (
+        context.evaluate({ scope: 'asset', recordId: String(old._id) }, 'brief').status ===
+        'approved'
+      )
+        fields.production.items = fields.production.items.map((item) =>
+          imageRevisionReview(
+            old.production?.items?.find((i) => i.id === item.id),
+            item
+          )
+        );
+    }
+    await referencedMedia([
+      ...(fields.production.sourceMediaIds ?? []),
+      ...(fields.production.items ?? [])
+        .flatMap((item) => [item.mediaId, ...(item.referenceMediaIds ?? [])])
+        .filter(Boolean)
+    ]);
     await validateOrganization(fields, old._id);
     await referencedMedia(fields.candidates.flatMap((c) => c.mediaIds));
     const oldFields = assetInput(JSON.parse(JSON.stringify(old)));
     const organizationOnly =
       JSON.stringify(assetCreativeFields(fields)) ===
       JSON.stringify(assetCreativeFields(oldFields));
+    fields.candidates = fields.candidates.map((c) => ({
+      ...c,
+      ...(old.candidates.find((o) => o.id === c.id)?.continuitySources?.length
+        ? { continuitySources: old.candidates.find((o) => o.id === c.id).continuitySources }
+        : {})
+    }));
     res.json({
       asset: await save(
         StudioAsset,
@@ -302,7 +610,7 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
               views:
                 old.kind === 'prop'
                   ? ['front', 'three-quarter', 'side', 'rear', 'detail']
-                  : ['front', 'three-quarter', 'side', 'rear', 'face'],
+                  : turnaroundViews,
               sourceCandidateId: candidate.id,
               sourceFinalizedAt: finalizedAt,
               approvedAt: finalizedAt
@@ -310,18 +618,21 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
           ]
         }
       : {};
-    res.json({
-      asset: await save(StudioAsset, old, {
-        ...sheetFields,
-        reviewStatus: null,
-        finalChoice: {
-          ...candidate,
-          finalizedAt,
-          assetBrief: old.brief,
-          assetName: old.name
-        }
-      })
+    const asset = await save(StudioAsset, old, {
+      ...sheetFields,
+      reviewStatus: null,
+      finalChoice: {
+        ...candidate,
+        finalizedAt,
+        assetBrief: old.brief,
+        assetName: old.name
+      }
     });
+    await req.app.locals.assistant.automation.afterApproval(
+      { scope: 'asset', recordId: String(old._id) },
+      { finalizedChoice: candidate.id, revision: asset.revision }
+    );
+    res.json({ asset });
   });
   router.post('/assets/:id/reopen', async (req, res) => {
     object(req.body);
@@ -364,6 +675,11 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
   });
   router.post('/episodes', async (req, res) => {
     const fields = episodeInput(req.body);
+    if (
+      activeProject()?.cinematicOnly &&
+      fields.scenes.some((scene) => scene.style !== 'cinematic')
+    )
+      fail('This storyline is entirely cinematic.');
     await validateEpisodeReferences(fields);
     for (const scene of fields.scenes)
       for (const clip of scene.clips)
@@ -382,6 +698,20 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
     object(req.body);
     const old = await existing(StudioEpisode, req.params.id, req.body.revision);
     const fields = episodeInput(req.body);
+    if (req.body.production === undefined) fields.production = old.production ?? {};
+    for (const scene of fields.scenes) {
+      const sent = req.body.scenes.find((s) => s.id === scene.id),
+        previous = old.scenes.find((s) => s.id === scene.id);
+      if (sent?.production === undefined) scene.production = previous?.production ?? {};
+      for (const clip of scene.clips)
+        if (sent?.clips.find((c) => c.id === clip.id)?.production === undefined)
+          clip.production = previous?.clips.find((c) => c.id === clip.id)?.production ?? {};
+    }
+    if (
+      activeProject()?.cinematicOnly &&
+      fields.scenes.some((scene) => scene.style !== 'cinematic')
+    )
+      fail('This storyline is entirely cinematic.');
     await validateEpisodeReferences(fields, req.params.id);
     fields.scenes = fields.scenes.map((scene) => ({
       ...scene,
@@ -394,6 +724,17 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
         : (old.scenes.find((s) => s.id === scene.id)?.soundPlan ?? null),
       clips: scene.clips.map((clip) => ({
         ...clip,
+        production: {
+          ...clip.production,
+          ...(old.scenes.find((s) => s.id === scene.id)?.clips.find((c) => c.id === clip.id)
+            ?.production?.audioRepairTakeId !== undefined
+            ? {
+                audioRepairTakeId: old.scenes
+                  .find((s) => s.id === scene.id)
+                  ?.clips.find((c) => c.id === clip.id).production.audioRepairTakeId
+              }
+            : {})
+        },
         soundLegacyTakeId:
           old.scenes.find((s) => s.id === scene.id)?.clips.find((c) => c.id === clip.id)
             ?.soundLegacyTakeId ??
@@ -421,10 +762,24 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
     res.json({ episode: episodeView(episode, await StudioAsset.find().lean()) });
   });
   router.post('/episodes/:id/scenes/:sceneId/approve', async (req, res) => {
+    if (workflowEnabled())
+      fail(
+        'Use the production board to approve the script, shot plan and sound plan separately.',
+        409
+      );
     object(req.body);
     const old = await existing(StudioEpisode, req.params.id, req.body.revision);
     const scene = old.scenes.find((s) => s.id === req.params.sceneId);
     if (!scene) fail('Scene not found.', 404);
+    if (
+      activeProject()?.faithfulAdaptation &&
+      !old.sourceReferences?.some(
+        (ref) => ref.status === 'verified' && scene.sourceReferenceIds?.includes(ref.id)
+      )
+    )
+      fail(
+        'Review and verify the source chapter and decisions before approving an adaptation scene.'
+      );
     if (!scene.script.trim() || !scene.clips.length)
       fail('Write the scene script and plan at least one clip before approval.');
     const assets = await StudioAsset.find().lean();
@@ -440,6 +795,7 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
     });
   });
   router.post('/episodes/:id/scenes/:sceneId/sound-plan/approve', async (req, res) => {
+    if (workflowEnabled()) fail('Approve the sound plan on the production board.', 409);
     const old = await existing(StudioEpisode, req.params.id, req.body.revision);
     const scene = old.scenes.find((s) => s.id === req.params.sceneId);
     if (!scene) fail('Scene not found.', 404);
@@ -462,7 +818,11 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
     res.attachment('roxy-production-brief.json').json({
       ...episodeView(episode, assets),
       prompts: episode.scenes.flatMap((s) =>
-        s.clips.map((c) => ({ scene: s.title, clip: c.title, ...clipPrompts(s, c, assets) }))
+        s.clips.map((c) => ({
+          scene: s.title,
+          clip: c.title,
+          ...clipPrompts(s, c, assets, episode)
+        }))
       )
     });
   });
@@ -471,13 +831,15 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
     const assets = await StudioAsset.find().lean();
     res.json({
       prompts: episode.scenes.flatMap((s) =>
-        s.clips.map((c) => ({ sceneId: s.id, clipId: c.id, ...clipPrompts(s, c, assets) }))
+        s.clips.map((c) => ({ sceneId: s.id, clipId: c.id, ...clipPrompts(s, c, assets, episode) }))
       )
     });
   });
   router.get('/episodes/:id/package', async (req, res) => {
     const source = await StudioEpisode.findById(id(req.params.id)).lean();
     if (!source) fail('Episode not found.', 404);
+    if (workflowEnabled())
+      await requireWorkflow({ scope: 'episode', recordId: String(source._id) }, 'export');
     const assets = await StudioAsset.find().lean();
     const episode = episodeView(source, assets);
     for (const scene of episode.scenes)
@@ -486,7 +848,7 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
       !episode.scenes.length ||
       episode.scenes.some(
         (s) =>
-          s.approvalStatus !== 'approved' ||
+          (!workflowEnabled() && s.approvalStatus !== 'approved') ||
           !s.clips.length ||
           s.clips.some((c) => !c.selectedTakeId)
       )
@@ -497,7 +859,26 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
     const linked = assets.filter((a) =>
       episode.scenes.some((s) => s.assetIds.map(String).includes(String(a._id)))
     );
+    const awaitMedia = nativeVideoWorkflow() ? await StudioMedia.find().lean() : [];
     const ids = [
+      ...(workflowEnabled()
+        ? (await workflowContext()).musicCues
+            .filter((c) => c.enabled && String(c.episodeId) === String(episode._id))
+            .flatMap((c) => [
+              c.selectedMediaId,
+              ...c.candidates
+                .filter((o) => o.mediaIds.map(String).includes(String(c.selectedMediaId)))
+                .map((o) => o.sourceMediaId)
+            ])
+            .filter(Boolean)
+        : []),
+      ...episode.scenes.flatMap((s) =>
+        s.clips
+          .map((c) =>
+            nativeVideoWorkflow() ? deliveryMediaId(c, awaitMedia) : c.production?.upscaleMediaId
+          )
+          .filter(Boolean)
+      ),
       ...episode.scenes.flatMap((s) => s.clips.map((c) => c.selectedTakeId)),
       ...episode.scenes.flatMap((s) => s.clips.map((c) => c.selectedDialogueId).filter(Boolean)),
       ...linked.flatMap((a) => a.finalChoice?.mediaIds ?? []),
@@ -518,6 +899,29 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
     const media = await referencedMedia(ids);
     await sendZip(res, mediaDirectory, media, {
       episode,
+      delivery: episode.scenes.flatMap((s) =>
+        s.clips.map((c) => ({
+          sceneId: s.id,
+          clipId: c.id,
+          mediaId: nativeVideoWorkflow()
+            ? deliveryMediaId(c, awaitMedia)
+            : (c.production?.upscaleMediaId ?? c.selectedTakeId)
+        }))
+      ),
+      music: workflowEnabled()
+        ? (await workflowContext()).musicCues
+            .filter((c) => c.enabled && String(c.episodeId) === String(episode._id))
+            .map((c) => ({
+              sceneId: c.sceneId,
+              mediaId: c.selectedMediaId,
+              startSeconds: 0,
+              durationSeconds: episode.scenes
+                .find((s) => s.id === c.sceneId)
+                ?.clips.reduce((n, clip) => n + clip.duration, 0),
+              placement:
+                'Separate music track in CapCut. Keep native clip sound effects and dialogue.'
+            }))
+        : [],
       assets: [
         ...linked,
         ...assets.filter(
@@ -535,27 +939,41 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
         kind: m.kind
       })),
       editing:
-        'Import the selected mixed clips into CapCut. Original sources, dialogue and separate effects stems are included for adjustment; do not stack them on top of the mixed track unless replacing that audio. Add music during final assembly.'
+        (workflowEnabled()
+          ? nativeVideoWorkflow()
+            ? 'Import the approved native 1080p videos in shot order into CapCut. Previously approved high-resolution deliveries remain available until replaced. '
+            : 'Import the QC-approved 1440p upscales in shot order into CapCut. '
+          : 'Import the selected mixed clips into CapCut. ') +
+        'Original sources, dialogue and separate effects stems are included for adjustment; do not stack them on top of the mixed track unless replacing that audio. Add music during final assembly.'
     });
   });
   router.put('/settings', async (req, res) => {
     object(req.body);
+    if (activeProject()?.cinematicOnly && req.body.vlogPercent !== 0)
+      fail('This storyline is entirely cinematic; vlog percentage must remain zero.');
     const fields = {
       era: text(req.body.era, 'Era', 200, true),
       targetSeconds: number(req.body.targetSeconds, 'Target runtime', 60, 7200),
       vlogPercent: number(req.body.vlogPercent, 'Vlog percentage', 0, 100),
       monthlyCredits: number(req.body.monthlyCredits, 'Monthly allowance', 0, 10000000),
       imageGeneration: structuredClone(imageGenerationDefaults),
-      videoUpscale: structuredClone(videoUpscaleDefaults),
+      videoGeneration: structuredClone(videoGenerationDefaults),
+      videoUpscale: structuredClone(nativeVideoWorkflow() ? noVideoUpscale : videoUpscaleDefaults),
       notes: text(req.body.notes ?? '', 'Series notes', 20000)
     };
     const settings = await StudioSettings.findOneAndUpdate(
-      { key: 'series', revision: revision(req.body.revision) },
+      { key: settingsKey(), revision: revision(req.body.revision) },
       { $set: fields, $inc: { revision: 1 } },
       { returnDocument: 'after' }
     ).lean();
     if (!settings) fail('Series settings changed in another tab. Your draft is preserved.', 409);
-    res.json({ settings });
+    res.json({
+      settings: {
+        ...settings,
+        workflowVersion: activeProject()?.workflowVersion ?? 0,
+        videoWorkflow: activeProject()?.videoWorkflow ?? 'legacy-upscale'
+      }
+    });
   });
   router.use((error, _req, res, next) => {
     if (error.status >= 400 && error.status < 500)

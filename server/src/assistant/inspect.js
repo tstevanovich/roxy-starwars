@@ -5,6 +5,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
 import { StudioEpisode, StudioMedia } from '../models/Studio.js';
+import { assertMediaAccess } from '../projects.js';
 import { fail, id } from '../studio-validation.js';
 
 const execute = promisify(execFile);
@@ -13,7 +14,15 @@ export async function inspectMedia(mediaId, { mediaDirectory }) {
   if (!media) fail('Media no longer exists.');
   if (basename(media.filename) !== media.filename) fail('Invalid media path.');
   const path = join(mediaDirectory, media.filename);
-  const info = { mediaId, name: media.originalName, kind: media.kind, bytes: media.bytes };
+  await assertMediaAccess([mediaId]);
+  const info = {
+    mediaId,
+    name: media.originalName,
+    kind: media.kind,
+    bytes: media.bytes,
+    ...(media.sourceFrame ? { sourceFrame: media.sourceFrame } : {}),
+    ...(media.sourceVideo ? { sourceVideo: media.sourceVideo } : {})
+  };
   if (media.kind === 'image') {
     if (media.bytes > 12 * 1024 * 1024)
       fail('This image exceeds the assistant’s 12 MB inspection limit.');

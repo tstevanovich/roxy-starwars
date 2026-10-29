@@ -6,6 +6,7 @@ import mongoose from 'mongoose';
 
 import { createAssistant } from './assistant/index.js';
 import { createAuth, securityHeaders } from './auth.js';
+import { projectMiddleware } from './projects.js';
 import { createStudioRouter } from './routes/studio.js';
 import { tasksRouter } from './routes/tasks.js';
 
@@ -29,6 +30,7 @@ export function createApp({ serveClient = false, mediaDirectory, auth = {}, assi
     app.use('/api/auth', authentication.router);
     app.use('/api', authentication.protect);
   }
+  app.use('/api/studio', projectMiddleware);
   app.use('/api/studio/assistant', studioAssistant.router);
   app.use('/api/studio', createStudioRouter({ mediaDirectory }));
   app.use(express.json({ limit: '16kb' }));

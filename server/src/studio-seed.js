@@ -1,5 +1,10 @@
-import { imageGenerationDefaults, videoUpscaleDefaults } from '../../shared/production-defaults.js';
+import {
+  imageGenerationDefaults,
+  noVideoUpscale,
+  videoGenerationDefaults
+} from '../../shared/production-defaults.js';
 import { StudioAsset, StudioSettings } from './models/Studio.js';
+import { legacyProjectKey, projectKey } from './project-context.js';
 
 const choice = (id, title, description) => ({ id, title, description, mediaIds: [] });
 const seeds = [
@@ -127,6 +132,7 @@ const seeds = [
 ];
 
 export async function seedStudio() {
+  if (projectKey() !== legacyProjectKey) return;
   await StudioAsset.bulkWrite(
     seeds.map((asset) => ({
       updateOne: {
@@ -158,7 +164,8 @@ export async function seedStudio() {
         vlogPercent: 33,
         monthlyCredits: 106000,
         imageGeneration: structuredClone(imageGenerationDefaults),
-        videoUpscale: structuredClone(videoUpscaleDefaults),
+        videoGeneration: structuredClone(videoGenerationDefaults),
+        videoUpscale: structuredClone(noVideoUpscale),
         revision: 0,
         createdAt: new Date(),
         updatedAt: new Date(),

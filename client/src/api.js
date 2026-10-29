@@ -1,3 +1,4 @@
+import { projectHeaders } from './project-url.js';
 let csrfToken = '';
 export function setCsrfToken(value) {
   csrfToken = value || '';
@@ -16,6 +17,7 @@ export async function request(path, { body, ...options } = {}) {
     ...options,
     credentials: 'same-origin',
     headers: {
+      ...(path.startsWith('/studio') ? projectHeaders() : {}),
       ...securityHeaders(options.method),
       ...(body ? { 'Content-Type': 'application/json' } : {}),
       ...options.headers
@@ -40,6 +42,7 @@ export async function uploadMedia(file) {
     method: 'POST',
     credentials: 'same-origin',
     headers: {
+      ...projectHeaders(),
       ...securityHeaders('POST'),
       'Content-Type': 'application/octet-stream',
       'X-File-Name': encodeURIComponent(file.name)

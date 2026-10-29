@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 
 import { removeMediaReferences } from '../../shared/media-rejection.js';
 import { reconcileEpisodeDraft } from './episode-draft.js';
+import { studioUrl } from './project-url.js';
 
 export function forgetRejectedMedia(mediaId) {
   const key = 'roxy-studio-rejected-media';
@@ -36,6 +37,7 @@ export const assetStatuses = {
   finalized: 'Finalized'
 };
 export function assetStatus(asset) {
+  if (asset.workflowStatus) return asset.workflowStatus;
   if (asset.reviewStatus === 'pending-choice') return 'pending-choice';
   if (asset.finalChoice) return 'finalized';
   if (!asset.reviewStatus && asset.candidates?.some((c) => !c.archived && c.mediaIds?.length))
@@ -49,15 +51,33 @@ export const assetStatusColor = (asset) =>
 export const uid = () => crypto.randomUUID();
 export const runtime = (seconds) =>
   `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
-export const mediaUrl = (id) => `/api/studio/media/${id}`;
+export const mediaUrl = (id) => studioUrl(`/api/studio/media/${id}`);
 export function pendingVideoChoices(episode, media) {
   const videos = new Set(media.filter((file) => file.kind === 'video').map((file) => file._id));
   return (episode.scenes ?? []).flatMap((scene) =>
     (scene.clips ?? [])
       .filter(
         (clip) =>
-          (!clip.selectedTakeId || clip.soundReviewStatus === 'needs-review') &&
-          clip.takeIds?.some((id) => videos.has(id))
+          clip.takeIds?.some(
+            (id) =>
+              id !== clip.selectedTakeId &&
+              media.some(
+                (m) =>
+                  m._id === id &&
+                  m.kind === 'video' &&
+                  m.videoReview?.state === 'pending' &&
+                  m.videoReview.episodeId === episode._id &&
+                  m.videoReview.sceneId === scene.id &&
+                  m.videoReview.clipId === clip.id
+              )
+          ) ||
+          ((!clip.selectedTakeId || clip.soundReviewStatus === 'needs-review') &&
+            clip.takeIds?.some(
+              (id) =>
+                videos.has(id) &&
+                (clip.pictureApprovalStatus !== 'approved' ||
+                  media.find((m) => m._id === id)?.soundMix)
+            ))
       )
       .map((clip) => ({ scene, clip }))
   );
@@ -106,7 +126,15 @@ export function useDraft(record, prefix, availableMedia) {
       const available = new Set(availableMedia.map((file) => file._id));
       const visit = (item, key = '') => {
         if (Array.isArray(item)) {
-          if (['mediaIds', 'takeIds', 'dialogueTakeIds'].includes(key))
+          if (
+            [
+              'mediaIds',
+              'takeIds',
+              'dialogueTakeIds',
+              'sourceMediaIds',
+              'referenceMediaIds'
+            ].includes(key)
+          )
             item.forEach((id) => {
               if (!available.has(id)) removed.add(id);
             });
@@ -119,7 +147,10 @@ export function useDraft(record, prefix, availableMedia) {
                 'selectedTakeId',
                 'selectedDialogueId',
                 'sourceTakeId',
-                'resultMediaId'
+                'resultMediaId',
+                'visualTakeId',
+                'upscaleMediaId',
+                'upscaleSourceTakeId'
               ].includes(name) &&
               entry &&
               !available.has(entry)

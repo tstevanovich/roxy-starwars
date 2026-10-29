@@ -59,6 +59,38 @@ test('merges imported takes and unrelated saved edits while retaining local text
   expect(remote.scenes[0].clips[0].action).toBe('She speaks.');
 });
 
+test('a restarted video pass does not resurrect old takes or selections from a cached draft', () => {
+  const local = structuredClone(base);
+  local.notes = 'Keep my unsaved notes.';
+  local.scenes[0].clips[0].takeIds = ['old-video'];
+  local.scenes[0].clips[0].selectedTakeId = 'old-video';
+  local.scenes[0].clips[0].production = { visualTakeId: 'old-video' };
+  const remote = {
+    ...latest,
+    videoPass: { id: 'new-pass' },
+    scenes: [
+      {
+        ...latest.scenes[0],
+        clips: [
+          {
+            ...latest.scenes[0].clips[0],
+            takeIds: [],
+            selectedTakeId: null,
+            production: { visualTakeId: null }
+          }
+        ]
+      }
+    ]
+  };
+  const result = reconcileEpisodeDraft(local, remote);
+  expect(result.conflicts).toEqual([]);
+  expect(result.episode.notes).toBe(local.notes);
+  expect(result.episode.scenes[0].clips[0].takeIds).toEqual([]);
+  expect(result.episode.scenes[0].clips[0].selectedTakeId).toBeNull();
+  expect(result.episode.scenes[0].clips[0].production.visualTakeId).toBeNull();
+  expect(result.episode.videoPass.id).toBe('new-pass');
+});
+
 test('overlapping edits block revision advancement until the user chooses while new media remains merged', () => {
   const local = { ...base, notes: 'My notes.' };
   const remote = { ...latest, notes: 'Saved notes.' };

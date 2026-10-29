@@ -20,11 +20,19 @@ import {
 } from '@mui/material';
 import { useRef, useState } from 'react';
 
+import { hasNativeAudio } from '../../shared/audio-policy.js';
 import { imageGenerationDefaults } from '../../shared/production-defaults.js';
 import { request } from './api.js';
+import NativeVideoImport from './NativeVideoImport.jsx';
+import ProductionBoard, { EnableWorkflow } from './ProductionBoard.jsx';
+import { ShotProductionInputs } from './ProductionInputs.jsx';
+import { studioUrl } from './project-url.js';
 import RejectMediaButton from './RejectMediaButton.jsx';
+import ReviewLinks from './ReviewLinks.jsx';
+import SceneMusic from './SceneMusic.jsx';
 import ShotImageReview from './ShotImageReview.jsx';
 import SoundDesign from './SoundDesign.jsx';
+import SourceReferences from './SourceReferences.jsx';
 import {
   downloadDraft,
   episodeTiming,
@@ -34,6 +42,91 @@ import {
   useDraft
 } from './studio-utils.js';
 import { ReferencePreview, UploadButton } from './StudioMedia.jsx';
+import UpscaleImport from './UpscaleImport.jsx';
+function VideoApprovalButton({
+  file,
+  clip,
+  scene,
+  workflow,
+  native1080,
+  disabled,
+  onPicture,
+  onVideo
+}) {
+  const picture = workflow && !file.soundMix;
+  const native = hasNativeAudio(file);
+  const approved = picture
+    ? clip.production?.visualTakeId === file._id &&
+      clip.pictureApprovalStatus === 'approved' &&
+      (!native || clip.selectedTakeId === file._id)
+    : clip.selectedTakeId === file._id;
+  const blockers = picture ? (clip.pictureReviewBlockers ?? scene.pictureReviewBlockers ?? []) : [];
+  return (
+    <Stack spacing={1}>
+      <Button
+        variant={approved ? 'outlined' : 'contained'}
+        disabled={
+          disabled ||
+          approved ||
+          blockers.length > 0 ||
+          (!picture && !file.soundMix && clip.soundLegacyTakeId !== file._id)
+        }
+        onClick={() =>
+          picture ? onPicture(scene.id, clip.id, file._id) : onVideo(scene.id, clip.id, file._id)
+        }
+      >
+        {picture
+          ? approved
+            ? native
+              ? 'Picture & sound approved'
+              : 'Picture & performance approved'
+            : native
+              ? 'Approve picture, performance & sound'
+              : 'Approve picture & performance'
+          : approved
+            ? 'Selected for edit'
+            : 'Approve video take'}
+      </Button>
+      {native && (
+        <Button
+          variant="outlined"
+          disabled={
+            disabled ||
+            blockers.length > 0 ||
+            approved ||
+            (clip.production?.audioRepairTakeId === file._id &&
+              clip.pictureApprovalStatus === 'approved')
+          }
+          onClick={() => onPicture(scene.id, clip.id, file._id, true)}
+        >
+          Accept picture; repair sound
+        </Button>
+      )}
+      {native && !approved && (
+        <Typography variant="body2">
+          Listen to the entire take: effects match the action, ambience is present, dialogue is
+          clear and there is no music.{' '}
+          {native1080
+            ? 'Approval keeps this native 1080p soundtrack and video for the edit.'
+            : 'Approving keeps this soundtrack and requests the 1440p upscale.'}{' '}
+          Use Sound design only if the audio needs repair.
+        </Typography>
+      )}
+      {blockers.length > 0 && (
+        <Alert severity="info">
+          Complete these reviews for this clip before picture approval: {blockers.join(', ')}.
+          <ReviewLinks
+            rows={clip.pictureReview?.prerequisites}
+            currentId={clip.pictureReview?.target.recordId}
+          />
+          <Button component="a" href={`#picture-prerequisites-${clip.id}`} size="small">
+            Review this clip's prerequisites
+          </Button>
+        </Alert>
+      )}
+    </Stack>
+  );
+}
 function EpisodeEditor({
   episode,
   assets,
@@ -67,6 +160,8 @@ function EpisodeEditor({
   const clipPanels = useRef(new Map());
   const pending = pendingVideoChoices(dirty ? episode : draft, media);
   const timing = episodeTiming(draft);
+  const workflow = settings?.workflowVersion === 1;
+  const native1080 = settings?.videoWorkflow === 'native-1080p';
   function jumpToScene(id) {
     const heading = id ? sceneHeadings.current.get(id) : episodeHeading.current;
     if (!heading) return;
@@ -137,6 +232,65 @@ function EpisodeEditor({
       // The recoverable draft stays intact if the refresh also fails.
     }
   }
+  async function approvePicture(sceneId, clipId, takeId, audioRepair = false) {
+    if (busy || dirty) return;
+    setBusy(true);
+    setError('');
+    setNotice('');
+    try {
+      let row = episode.scenes
+        .find((s) => s.id === sceneId)
+        ?.clips.find((c) => c.id === clipId)?.pictureReview;
+      if (!row) {
+        const board = await request('/studio/workflow/board', {
+          method: 'POST',
+          body: { target: { scope: 'episode', recordId: episode._id } }
+        });
+        row = board.groups
+          .find(
+            (g) =>
+              g.target.scope === 'clip' &&
+              g.target.sceneId === sceneId &&
+              g.target.clipId === clipId
+          )
+          ?.stages.find((r) => r.stage === 'visual');
+      }
+      if (!row) throw new Error('Picture review is unavailable. Refresh the episode.');
+      await request('/studio/workflow/review', {
+        method: 'POST',
+        body: {
+          target: row.target,
+          stage: 'visual',
+          action: 'approve',
+          takeId,
+          ...(audioRepair ? { audioRepair: true } : {}),
+          fingerprint: row.fingerprint,
+          parentRevision: row.parentRevision,
+          reviewRevision: row.reviewRevision
+        }
+      });
+      const studio = await request('/studio');
+      const next = studio.episodes.find((e) => e._id === episode._id);
+      if (next) {
+        saved(next);
+        onSaved(next);
+      }
+      onReload?.();
+      setNotice(
+        audioRepair
+          ? 'Picture accepted for sound repair. No finished take or upscale has been approved.'
+          : hasNativeAudio(media.find((m) => m._id === takeId))
+            ? native1080
+              ? 'Native 1080p picture, performance and sound approved. Ready for the edit; no upscale required.'
+              : 'Picture, performance and native sound approved. The 1440p upscale request is recorded.'
+            : 'Picture and performance approved. The finished sound mix is reviewed separately.'
+      );
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
   async function approveVideo(sceneId, clipId, takeId) {
     if (busy || dirty) return;
     setBusy(true);
@@ -161,9 +315,43 @@ function EpisodeEditor({
       });
       saved(next);
       onSaved(next);
-      setNotice('Video take approved and saved. A 1440p (2K) upscale has been requested.');
+      if (workflow) onReload?.();
+      setNotice(
+        workflow
+          ? native1080
+            ? 'Finished 1080p sound mix approved and saved. No upscale required.'
+            : 'Finished mix approved and saved. The 1440p request is recorded; import the completed upscale for quality review.'
+          : native1080
+            ? '1080p video take approved and saved. No upscale required.'
+            : 'Video take approved and saved. A 1440p (2K) upscale has been requested.'
+      );
     } catch (e) {
       await handleError(e);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function importUpscale(sceneId, clipId, file) {
+    if (busy || dirty) throw new Error('Save your episode edits before importing an upscale.');
+    const clip = episode.scenes.find((s) => s.id === sceneId)?.clips.find((c) => c.id === clipId);
+    if (!clip?.selectedTakeId) throw new Error('Approve the original video first.');
+    setBusy(true);
+    setError('');
+    onMedia(file);
+    try {
+      const result = await request('/studio/workflow/upscale/import', {
+        method: 'POST',
+        body: {
+          target: { scope: 'clip', recordId: episode._id, sceneId, clipId },
+          parentRevision: episode.revision,
+          sourceTakeId: clip.selectedTakeId,
+          mediaId: file._id
+        }
+      });
+      onSaved(result.episode);
+      setNotice(`Upscale saved: ${file.originalName}. Review its 1440p quality next.`);
+      await onReload?.();
+      return result;
     } finally {
       setBusy(false);
     }
@@ -195,6 +383,7 @@ function EpisodeEditor({
         );
         saved(next);
         onSaved(next);
+        if (workflow) onReload?.();
         setNotice(
           action === 'approve'
             ? 'Scene script, planned clips and sound plan approved.'
@@ -224,6 +413,7 @@ function EpisodeEditor({
   }
   const ready =
     !dirty &&
+    (!workflow || draft.workflowReady) &&
     draft.scenes.length > 0 &&
     draft.scenes.every(
       (s) =>
@@ -231,6 +421,14 @@ function EpisodeEditor({
     );
   return (
     <Stack spacing={3}>
+      {draft.videoPass?.policy === 'wan-native-effects-v1' && (
+        <Alert severity="info">
+          Episode video pass restarted with Wan sound effects and ambience. Previous files remain in
+          Media library. Review any outstanding script, shot plan and image choices below; approved
+          inputs are reused. Each new video waits for your picture and sound approval before the
+          next.
+        </Alert>
+      )}
       <Button
         startIcon={<ArrowBackOutlined />}
         onClick={onBack}
@@ -252,7 +450,13 @@ function EpisodeEditor({
       >
         <Box>
           <Typography variant="overline">Episode workspace</Typography>
-          <Typography variant="h1" ref={episodeHeading} tabIndex={-1} className="scene-heading">
+          <Typography
+            id="episode-top"
+            variant="h1"
+            ref={episodeHeading}
+            tabIndex={-1}
+            className="scene-heading"
+          >
             {draft.title}
           </Typography>
         </Box>
@@ -338,12 +542,20 @@ function EpisodeEditor({
           to keep the combined version.
         </Alert>
       )}
+      {workflow && episode.workflowReviewCount > 0 && (
+        <Button component="a" href="#production-approval-board" variant="outlined">
+          Production reviews waiting for you ({episode.workflowReviewCount})
+        </Button>
+      )}
       {pending.length > 0 && (
         <Box component="section" aria-label="Pending video choices" className="editor-panel">
           <Typography variant="h2">Pending video choices ({pending.length})</Typography>
           <Typography color="text.secondary" sx={{ mt: 1, mb: 2 }}>
-            Watch these finished takes with sound, then choose Approve video take beside the player.
-            Approval saves your selection and requests a 1440p (2K) upscale.
+            {workflow
+              ? 'New Wan takes include sound effects and ambience. Review picture, performance and sound together, including the absence of music. Approve a good take directly; use Sound design only when audio needs repair. Music belongs in CapCut.'
+              : native1080
+                ? 'Watch these finished 1080p takes with sound, then approve a video take in its clip. No upscale is required.'
+                : 'Watch these finished takes with sound, then approve a video take in its clip. Approval saves the selection and requests a 1440p upscale.'}
           </Typography>
           {dirty && <Alert severity="info">Save your draft before approving a video take.</Alert>}
           <Stack spacing={1}>
@@ -367,24 +579,91 @@ function EpisodeEditor({
                 >
                   Review video: {clip.title} · {scene.title}
                 </Button>
-                {newerSavedVersion &&
-                  (clip.takeIds ?? []).map((id) => {
-                    const file = media.find((item) => item._id === id && item.kind === 'video');
-                    const inDraft = draft.scenes
-                      .find((item) => item.id === scene.id)
-                      ?.clips.find((item) => item.id === clip.id)
-                      ?.takeIds?.includes(id);
-                    return file && !inDraft ? (
-                      <Box className="attachment" key={id}>
-                        <ReferencePreview file={file} kind="video" />
-                        <Typography sx={{ p: 2 }}>
-                          {clip.title} · Saved video: {file.originalName}
-                        </Typography>
+                {[...(clip.takeIds ?? [])].reverse().map((id) => {
+                  const file = media.find((item) => item._id === id && item.kind === 'video');
+                  return file ? (
+                    <Box className="attachment" key={id}>
+                      <ReferencePreview file={file} kind="video" />
+                      <Typography sx={{ p: 2 }}>
+                        {clip.title} ·{' '}
+                        {file.soundMix
+                          ? 'Finished sound mix'
+                          : hasNativeAudio(file)
+                            ? 'Picture / performance / native sound take'
+                            : 'Picture / performance take'}
+                        : {file.originalName}
+                      </Typography>
+                      <Box sx={{ px: 2, pb: 2 }}>
+                        <VideoApprovalButton
+                          file={file}
+                          clip={clip}
+                          scene={scene}
+                          workflow={workflow}
+                          native1080={native1080}
+                          disabled={busy || dirty}
+                          onPicture={approvePicture}
+                          onVideo={approveVideo}
+                        />
+                        <RejectMediaButton
+                          file={file}
+                          disabled={busy || dirty}
+                          context={{
+                            episodeId: episode._id,
+                            revision: episode.revision,
+                            sceneId: scene.id,
+                            clipId: clip.id
+                          }}
+                          onRejected={onRejected}
+                        />
                       </Box>
-                    ) : null;
-                  })}
+                    </Box>
+                  ) : null;
+                })}
               </Stack>
             ))}
+          </Stack>
+        </Box>
+      )}
+      {workflow ? (
+        <ProductionBoard
+          record={episode}
+          scope="episode"
+          assets={assets}
+          media={media}
+          saving={busy}
+          draftPending={dirty}
+          onChanged={onReload}
+          onImportUpscale={importUpscale}
+        />
+      ) : (
+        <EnableWorkflow disabled={busy || dirty} />
+      )}
+      {workflow && (
+        <Box className="editor-panel">
+          <Stack spacing={2}>
+            <Typography variant="h2">Episode planning</Typography>
+            <TextField
+              label="Source research / original story direction"
+              multiline
+              minRows={3}
+              value={draft.production?.sourceNotes ?? ''}
+              onChange={(e) =>
+                field('production', { ...draft.production, sourceNotes: e.target.value })
+              }
+            />
+            <TextField
+              label="Episode outline for approval"
+              multiline
+              minRows={4}
+              value={draft.production?.outline ?? ''}
+              onChange={(e) =>
+                field('production', {
+                  ...draft.production,
+                  outline: e.target.value,
+                  outlineNeedsRevision: false
+                })
+              }
+            />
           </Stack>
         </Box>
       )}
@@ -430,6 +709,14 @@ function EpisodeEditor({
             ))}
           </TextField>
         </Box>
+      )}
+      {(draft.sourceReferences?.length > 0 || settings.cinematicOnly) && (
+        <SourceReferences
+          disabled={busy || dirty}
+          onMedia={onMedia}
+          episode={draft}
+          onEdit={(patch) => edit((current) => ({ ...current, ...patch }))}
+        />
       )}
       <Box className="runtime-strip">
         <Box>
@@ -562,6 +849,7 @@ function EpisodeEditor({
                   scene.approvalStatus === 'approved'
                 }
                 onClick={() => run('approve', scene.id)}
+                sx={workflow ? { display: 'none' } : undefined}
                 startIcon={<CheckCircleOutlined />}
               >
                 Approve script
@@ -600,7 +888,9 @@ function EpisodeEditor({
                 }}
               >
                 <MenuItem value="cinematic">Cinematic</MenuItem>
-                <MenuItem value="vlog">Vlog to audience</MenuItem>
+                <MenuItem value="vlog" disabled={settings.cinematicOnly}>
+                  Vlog to audience
+                </MenuItem>
               </TextField>
             </Stack>
             <TextField
@@ -654,6 +944,39 @@ function EpisodeEditor({
                   </MenuItem>
                 ))}
             </TextField>
+            {draft.sourceReferences?.length > 0 && (
+              <>
+                <TextField
+                  select
+                  fullWidth
+                  label="Source footage for this scene"
+                  value={scene.sourceReferenceIds ?? []}
+                  slotProps={{ select: { multiple: true } }}
+                  onChange={(e) => sceneEdit(scene.id, { sourceReferenceIds: e.target.value })}
+                >
+                  {draft.sourceReferences.map((ref) => (
+                    <MenuItem key={ref.id} value={ref.id}>
+                      {ref.chapter || ref.title} - {ref.status}
+                    </MenuItem>
+                  ))}
+                </TextField>
+                <TextField
+                  multiline
+                  label="Scene source notes and adaptation choices"
+                  value={scene.sourceNotes ?? ''}
+                  onChange={(e) => sceneEdit(scene.id, { sourceNotes: e.target.value })}
+                />
+              </>
+            )}
+            {workflow && (
+              <SceneMusic
+                episode={draft}
+                scene={scene}
+                dirty={dirty}
+                busy={busy}
+                onReload={onReload}
+              />
+            )}
             <SoundDesign
               episode={draft}
               scene={scene}
@@ -729,6 +1052,11 @@ function EpisodeEditor({
                       }}
                     />
                   </Stack>
+                  <Box
+                    id={`shot-inputs-${clip.id}`}
+                    tabIndex={-1}
+                    sx={{ scrollMarginTop: '128px' }}
+                  />
                   {assets
                     .filter(
                       (asset) =>
@@ -770,14 +1098,18 @@ function EpisodeEditor({
                         not select it for the edit.
                       </Typography>
                       <Typography variant="body2" color="text.secondary">
-                        Approve video take saves your choice and requests a 1440p (2K) upscale. The
-                        original review video is retained. Save any draft edits first.
+                        {native1080
+                          ? 'Approve the native 1080p video with its soundtrack for direct use in CapCut. No upscale step is required.'
+                          : 'Approve video take saves your choice and requests a 1440p (2K) upscale. The original review video is retained.'}{' '}
+                        Save any draft edits first.
                       </Typography>
                       {[...clip.takeIds].reverse().map((id) => {
                         const file = media.find((m) => m._id === id);
                         return (
                           <Box key={id} className="attachment">
-                            <ReferencePreview file={file} kind="video" />
+                            {!pending.some(({ clip: choice }) => choice.id === clip.id) && (
+                              <ReferencePreview file={file} kind="video" />
+                            )}
                             <Stack spacing={1} sx={{ p: 2 }}>
                               <Typography>{file?.originalName || 'Missing video take'}</Typography>
                               <Typography variant="caption">
@@ -787,34 +1119,33 @@ function EpisodeEditor({
                                     ? 'Previously approved take'
                                     : 'Original video: create a sound mix before approval'}
                               </Typography>
-                              <Button
-                                variant={clip.selectedTakeId === id ? 'outlined' : 'contained'}
-                                disabled={
-                                  busy ||
-                                  dirty ||
-                                  !file ||
-                                  clip.selectedTakeId === id ||
-                                  (!file.soundMix && clip.soundLegacyTakeId !== id)
-                                }
-                                onClick={() => approveVideo(scene.id, clip.id, id)}
-                              >
-                                {clip.selectedTakeId === id
-                                  ? 'Selected for edit'
-                                  : 'Approve video take'}
-                              </Button>
-                              {file && (
-                                <RejectMediaButton
-                                  file={file}
-                                  disabled={busy || dirty}
-                                  context={{
-                                    episodeId: draft._id,
-                                    revision: draft.revision,
-                                    sceneId: scene.id,
-                                    clipId: clip.id
-                                  }}
-                                  onRejected={onRejected}
-                                />
-                              )}
+                              {file &&
+                                !pending.some(({ clip: choice }) => choice.id === clip.id) && (
+                                  <VideoApprovalButton
+                                    file={file}
+                                    clip={clip}
+                                    scene={scene}
+                                    workflow={workflow}
+                                    native1080={native1080}
+                                    disabled={busy || dirty}
+                                    onPicture={approvePicture}
+                                    onVideo={approveVideo}
+                                  />
+                                )}
+                              {file &&
+                                !pending.some(({ clip: choice }) => choice.id === clip.id) && (
+                                  <RejectMediaButton
+                                    file={file}
+                                    disabled={busy || dirty}
+                                    context={{
+                                      episodeId: draft._id,
+                                      revision: draft.revision,
+                                      sceneId: scene.id,
+                                      clipId: clip.id
+                                    }}
+                                    onRejected={onRejected}
+                                  />
+                                )}
                             </Stack>
                           </Box>
                         );
@@ -844,6 +1175,58 @@ function EpisodeEditor({
                       })
                     }
                   />
+                  {clip.dialogue?.trim() && (
+                    <Stack spacing={1}>
+                      <Typography>
+                        Final mixes require a dialogue-only audio stem with the video's timing and
+                        duration. Generated video audio is excluded because it may contain music.
+                        Import cleaned synchronized speech, then review lip sync in the finished
+                        mix.
+                      </Typography>
+                      <UploadButton
+                        label="Import synchronized dialogue-only stem"
+                        onUploaded={(file) => {
+                          onMedia(file);
+                          if (file.kind !== 'audio') {
+                            setError('Choose an audio file for the dialogue-only stem.');
+                            return;
+                          }
+                          clipEdit(scene.id, clip.id, {
+                            production: { ...clip.production, cleanDialogueMediaId: file._id }
+                          });
+                        }}
+                      />
+                      {clip.production?.cleanDialogueMediaId && (
+                        <ReferencePreview
+                          file={media.find((m) => m._id === clip.production.cleanDialogueMediaId)}
+                        />
+                      )}
+                    </Stack>
+                  )}
+                  {workflow && (
+                    <>
+                      {!native1080 && (
+                        <UpscaleImport
+                          clip={clip}
+                          media={media}
+                          episodeId={episode._id}
+                          sceneId={scene.id}
+                          disabled={busy || dirty}
+                          onImport={importUpscale}
+                          showReviewLink
+                        />
+                      )}
+                      <ShotProductionInputs
+                        episode={draft}
+                        assets={assets}
+                        scene={scene}
+                        clip={clip}
+                        media={media}
+                        onEdit={(production) => clipEdit(scene.id, clip.id, { production })}
+                        onMedia={onMedia}
+                      />
+                    </>
+                  )}
                   <Stack
                     direction={{
                       xs: 'column',
@@ -969,7 +1352,8 @@ function EpisodeEditor({
                         </MenuItem>
                       ))}
                   </TextField>
-                  {clip.upscale?.status === 'waiting-provider' &&
+                  {!workflow &&
+                    clip.upscale?.status === 'waiting-provider' &&
                     clip.upscale.sourceTakeId === clip.selectedTakeId && (
                       <Alert severity="warning">
                         <strong>2K upscale waiting for provider connection.</strong>{' '}
@@ -982,19 +1366,36 @@ function EpisodeEditor({
                         .find((s) => s.id === scene.id)
                         ?.clips.find((c) => c.id === clip.id)?.selectedTakeId && (
                       <Typography variant="body2" color="text.secondary">
-                        Save episode to record this video approval and its 2K upscale request.
+                        {native1080
+                          ? 'Save episode to record this video selection. No upscale is required.'
+                          : 'Save episode to record this video approval and its 2K upscale request.'}
                       </Typography>
                     )}
-                  <UploadButton
-                    label="Import a video take"
-                    onUploaded={(file) => {
-                      onMedia(file);
-                      if (file.kind === 'video')
-                        clipEdit(scene.id, clip.id, {
-                          takeIds: [...new Set([...(clip.takeIds ?? []), file._id])]
-                        });
-                    }}
-                  />
+                  {native1080 ? (
+                    <NativeVideoImport
+                      episode={episode}
+                      scene={scene}
+                      clip={clip}
+                      disabled={busy || dirty}
+                      onMedia={onMedia}
+                      onSaved={(next) => {
+                        saved(next);
+                        onSaved(next);
+                        onReload?.();
+                      }}
+                    />
+                  ) : (
+                    <UploadButton
+                      label="Import a video take"
+                      onUploaded={(file) => {
+                        onMedia(file);
+                        if (file.kind === 'video')
+                          clipEdit(scene.id, clip.id, {
+                            takeIds: [...new Set([...(clip.takeIds ?? []), file._id])]
+                          });
+                      }}
+                    />
+                  )}
                   {clip.selectedTakeId && !(clip.takeIds ?? []).includes(clip.selectedTakeId) && (
                     <ReferencePreview file={media.find((m) => m._id === clip.selectedTakeId)} />
                   )}
@@ -1127,7 +1528,7 @@ function EpisodeEditor({
           </Button>
           <Button
             component="a"
-            href={`/api/studio/episodes/${draft._id}/brief`}
+            href={studioUrl(`/api/studio/episodes/${draft._id}/brief`)}
             startIcon={<DownloadOutlined />}
             disabled={dirty}
           >
@@ -1135,7 +1536,7 @@ function EpisodeEditor({
           </Button>
           <Button
             component="a"
-            href={ready ? `/api/studio/episodes/${draft._id}/package` : undefined}
+            href={ready ? studioUrl(`/api/studio/episodes/${draft._id}/package`) : undefined}
             variant="contained"
             startIcon={<DownloadOutlined />}
             disabled={!ready}
@@ -1321,23 +1722,26 @@ export default function Episodes({
         const approved = e.scenes.filter((scene) => scene.approvalStatus === 'approved').length;
         const selectedTakes = clips.filter((clip) => clip.selectedTakeId).length;
         const pendingCount = pendingVideoChoices(e, media).length;
+        const productionReviews = e.workflowReviewCount ?? 0;
         const ready =
           e.scenes.length > 0 &&
           approved === e.scenes.length &&
           e.scenes.every((scene) => scene.clips.length > 0) &&
           selectedTakes === clips.length;
         const needsReview = e.scenes.some((scene) => scene.approvalStatus === 'needs-review');
-        const status = pendingCount
-          ? `Pending choice (${pendingCount} video ${pendingCount === 1 ? 'clip' : 'clips'})`
-          : ready
-            ? 'Ready for editing'
-            : needsReview
-              ? 'Needs review'
-              : e.scenes.length
-                ? 'Scenes in development'
-                : e.premise?.trim()
-                  ? 'Outline draft'
-                  : 'New episode';
+        const status = productionReviews
+          ? `Pending choice (${productionReviews} production ${productionReviews === 1 ? 'review' : 'reviews'})`
+          : pendingCount
+            ? `Pending choice (${pendingCount} video ${pendingCount === 1 ? 'clip' : 'clips'})`
+            : ready
+              ? 'Ready for editing'
+              : needsReview
+                ? 'Needs review'
+                : e.scenes.length
+                  ? 'Scenes in development'
+                  : e.premise?.trim()
+                    ? 'Outline draft'
+                    : 'New episode';
         const fallback = (e.premise || '').replace(/\s+/g, ' ').trim();
         const summary =
           e.synopsis?.trim() ||
@@ -1354,7 +1758,13 @@ export default function Episodes({
               <Chip
                 size="small"
                 label={status}
-                color={pendingCount || needsReview ? 'warning' : ready ? 'success' : 'default'}
+                color={
+                  productionReviews || pendingCount || needsReview
+                    ? 'warning'
+                    : ready
+                      ? 'success'
+                      : 'default'
+                }
               />
             </Stack>
             <Typography

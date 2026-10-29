@@ -4,6 +4,10 @@ A local production studio for the Roxy Kane series, built with React, Material U
 
 Read the [studio guide](docs/STUDIO-GUIDE.md) for saving choices, local storage, scene approvals, and CapCut exports. The [production brief](docs/PRODUCTION-BRIEF.md) records the creative requirements. [Production chat](docs/PRODUCTION-CHAT.md) adds story collaboration, reviewable scene drafts, OpenArt render requests and ElevenLabs dialogue generation. Each scene also has a sound-design plan, individual effects review, and local FFmpeg mixing before new video approval; see the [sound workflow](docs/STUDIO-GUIDE.md#sound-design-and-finished-video-review). FFmpeg and FFprobe must be on PATH (or set FFMPEG_PATH and FFPROBE_PATH). Connect your ChatGPT plan on the studio PC through its owner-only Connections screen. Studio chat has no API-key billing fallback; OpenArt and ElevenLabs use their own accounts/credits.
 
+With MongoDB running, `npm.cmd run project:inquisitor` initializes the separate Sith Inquisitor workspace once and preserves existing records on subsequent runs.
+
+Use the **Project / class storyline** selector for separate series. The Old Republic / Sith Inquisitor workspace has its own cinematic-only settings, episode source references, decisions, voice and wardrobe choices; see [projects and gameplay adaptations](docs/STUDIO-GUIDE.md#projects-and-gameplay-adaptations).
+
 The studio now requires your single-owner login on desktop and phone. See [remote access and account setup](docs/REMOTE-ACCESS.md) for your private HTTPS tunnel, first sign-in, mobile controls, starting/stopping access and local password recovery.
 
 ## Requirements
@@ -174,3 +178,5 @@ This scaffold has no authentication: tasks are shared by everyone who can reach 
 - [Material UI documentation](https://mui.com/material-ui/)
 - [Express documentation](https://expressjs.com/)
 - [Mongoose connections](https://mongoosejs.com/docs/connections.html)
+
+New Wan videos include native sound effects and ambience. Review and approve picture, performance and sound together; use the separate sound tools only for audio repairs. Music stays in CapCut. See [the production workflow](docs/STUDIO-GUIDE.md#production-approval-board).

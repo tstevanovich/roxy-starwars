@@ -20,8 +20,11 @@ import {
 } from '@mui/material';
 import { useEffect, useRef, useState } from 'react';
 
+import { proposalStageLabel } from '../../shared/production-proposals.js';
 import { request, uploadMedia } from './api.js';
 import ChatGPTConnection from './ChatGPTConnection.jsx';
+import { DraftSupportingNotes, ProposalContent } from './ProductionDrafts.jsx';
+import { reviewHref } from './review-navigation.js';
 import { ReferencePreview } from './StudioMedia.jsx';
 
 const base = '/studio/assistant';
@@ -85,7 +88,7 @@ function Connections({ onClose, initial, refresh }) {
           {connections?.openart.connected && connections.openart.referenceSharing && (
             <Alert severity={connections.openart.referenceSharing.ready ? 'info' : 'warning'}>
               {connections.openart.referenceSharing.ready
-                ? 'Secure reference sharing is configured through your public studio address. Local PC sign-in is supported.'
+                ? 'Reference files are uploaded to OpenArt and verified before rendering. Reference delivery works independently of the remote studio address.'
                 : connections.openart.referenceSharing.message}
             </Alert>
           )}
@@ -309,7 +312,8 @@ function Composer({ chatId, disabled, onSent, data, onMedia }) {
 }
 function Conversation({ chatId, data, onMedia, onReview, configured, onChanged }) {
   const [detail, setDetail] = useState(null),
-    [error, setError] = useState('');
+    [error, setError] = useState(''),
+    [mutation, setMutation] = useState(null);
   const bottom = useRef(null),
     scroller = useRef(null),
     lastCount = useRef(0);
@@ -354,12 +358,15 @@ function Conversation({ chatId, data, onMedia, onReview, configured, onChanged }
     lastCount.current = detail.messages.length;
   }, [detail]);
   async function action(path) {
+    if (mutation?.busy) return;
+    setMutation({ path, busy: true });
     try {
-      await request(base + path, { method: 'POST', body: {} });
+      const result = await request(base + path, { method: 'POST', body: {} });
+      setMutation({ path, busy: false, result });
       await refresh();
       onChanged();
     } catch (e) {
-      setError(e.message);
+      setMutation({ path, busy: false, error: e.message });
     }
   }
   if (!detail)
@@ -373,6 +380,9 @@ function Conversation({ chatId, data, onMedia, onReview, configured, onChanged }
   return (
     <Stack spacing={2}>
       {error && <Alert severity="error">{error}</Alert>}
+      {mutation?.error && !mutation.path.startsWith('/proposals/') && (
+        <Alert severity="error">{mutation.error}</Alert>
+      )}
       <Box
         className="chat-transcript"
         ref={scroller}
@@ -400,9 +410,17 @@ function Conversation({ chatId, data, onMedia, onReview, configured, onChanged }
               {m.text}
             </Typography>
             {m.mediaIds?.map((mid) => {
-              const file = data.media.find((m) => m._id === mid);
+              const file =
+                detail.media?.find((m) => m._id === mid) ?? data.media.find((m) => m._id === mid);
               return file ? (
                 <Box key={mid} sx={{ maxWidth: 340, mt: 1 }}>
+                  {file.sourceFrame && (
+                    <Typography variant="caption">
+                      Source {Math.floor(file.sourceFrame.requestedSeconds / 60)}:
+                      {String(Math.floor(file.sourceFrame.requestedSeconds % 60)).padStart(2, '0')}{' '}
+                      · {file.sourceFrame.view === 'subtitle-crop' ? 'Subtitle crop' : 'Full frame'}
+                    </Typography>
+                  )}
                   <ReferencePreview file={file} kind={file.kind} />
                 </Box>
               ) : (
@@ -440,12 +458,16 @@ function Conversation({ chatId, data, onMedia, onReview, configured, onChanged }
         onSent={refresh}
       />
       {detail.proposals
-        .filter((p) => p.status !== 'dismissed')
+        .filter((p) => !['dismissed', 'superseded'].includes(p.status))
         .map((p) => (
           <Box key={p._id} className="editor-panel chat-result">
             <Chip
               label={
-                p.status === 'applied' ? 'Draft applied' : 'Story draft · review before applying'
+                p.status === 'applied'
+                  ? p.render
+                    ? 'Video revision approved'
+                    : 'Draft applied'
+                  : `${proposalStageLabel(p)} draft · review before applying`
               }
               color={p.status === 'applied' ? 'success' : 'warning'}
               size="small"
@@ -454,8 +476,10 @@ function Conversation({ chatId, data, onMedia, onReview, configured, onChanged }
               {p.title}
             </Typography>
             <Typography className="chat-message-text" sx={{ my: 1 }}>
-              {p.text}
+              {p.production ? p.text?.split('\n\n{')[0] : p.text}
             </Typography>
+            {(p.production || p.render) && <ProposalContent proposal={p} />}
+            {!p.production && !p.render && <DraftSupportingNotes notes={p.supportingNotes} />}
             {p.scene && (
               <details>
                 <summary>Read proposed scene and clips</summary>
@@ -479,20 +503,61 @@ function Conversation({ chatId, data, onMedia, onReview, configured, onChanged }
             <Stack direction="row" sx={{ flexWrap: 'wrap', gap: 1, mt: 2 }}>
               {p.status === 'pending' && (
                 <>
-                  <Button variant="contained" onClick={() => action(`/proposals/${p._id}/apply`)}>
-                    Apply draft
+                  <Button
+                    variant="contained"
+                    disabled={Boolean(mutation?.busy) || p.application?.canApply === false}
+                    onClick={() =>
+                      action(`/proposals/${p._id}/${p.render ? 'approve-render' : 'apply'}`)
+                    }
+                  >
+                    {mutation?.busy && mutation.path.startsWith(`/proposals/${p._id}/`)
+                      ? 'Applying draft…'
+                      : p.render
+                        ? 'Approve revision & generate video'
+                        : 'Apply draft'}
                   </Button>
-                  <Button onClick={() => action(`/proposals/${p._id}/dismiss`)}>
+                  <Button
+                    disabled={Boolean(mutation?.busy)}
+                    onClick={() => action(`/proposals/${p._id}/dismiss`)}
+                  >
                     Dismiss draft
                   </Button>
                 </>
               )}
-              <Button onClick={() => onReview('episodes', p.episodeId)}>Open episode</Button>
+              <Button
+                onClick={() =>
+                  onReview(p.assetId ? 'library' : 'episodes', p.assetId || p.episodeId)
+                }
+              >
+                Open {p.assetId ? 'asset' : 'episode'}
+              </Button>
             </Stack>
+            {mutation?.path.startsWith(`/proposals/${p._id}/`) && mutation.error && (
+              <Alert severity="error">{mutation.error}</Alert>
+            )}
+            {mutation?.path.startsWith(`/proposals/${p._id}/`) && mutation.result?.applied && (
+              <Alert severity="success">
+                Draft applied. Your revised directions are saved; no approval or render was started.
+                {mutation.result.nextReview && (
+                  <Button
+                    component="a"
+                    href={reviewHref(
+                      mutation.result.nextReview.target,
+                      mutation.result.nextReview.stage
+                    )}
+                  >
+                    Review revision directions
+                  </Button>
+                )}
+              </Alert>
+            )}
             <Typography variant="caption">
-              Applying a scene draft reopens its script and shot images for approval and clears its
-              selected performances. Earlier takes remain available.
+              Applying a scene draft keeps saved takes and selections. Changed creative inputs
+              require review again before production continues.
             </Typography>
+            {p.status === 'pending' && p.application?.canApply === false && (
+              <Alert severity="warning">{p.application.reason}</Alert>
+            )}
           </Box>
         ))}
       {detail.jobs.map((job) => (
@@ -515,7 +580,7 @@ function Conversation({ chatId, data, onMedia, onReview, configured, onChanged }
             {job.kind === 'image'
               ? 'GPT Image 2.5 Sunburst · 2K · high quality'
               : job.kind === 'video'
-                ? 'Wan 3.0 Standard · 480p · 16:9 · no music'
+                ? 'Wan 3.0 Standard · 1080p · 16:9 · no music'
                 : job.kind === 'sound'
                   ? 'ElevenLabs sound effects - review audio before mixing'
                   : job.kind === 'mix'

@@ -18,7 +18,9 @@ import {
   Drawer,
   IconButton,
   LinearProgress,
+  MenuItem,
   Stack,
+  TextField,
   Typography
 } from '@mui/material';
 import { lazy, Suspense, useEffect, useState } from 'react';
@@ -27,6 +29,8 @@ import { removeMediaReferences } from '../../shared/media-rejection.js';
 import { imageGenerationDefaults } from '../../shared/production-defaults.js';
 import { request } from './api.js';
 import { AccountControls } from './AuthGate.jsx';
+import { studioUrl } from './project-url.js';
+import { reviewAnchor, reviewHref } from './review-navigation.js';
 import SeriesBible from './SeriesBible.jsx';
 import {
   assetStatus,
@@ -89,8 +93,9 @@ function Overview({ data, navigate }) {
               my: 3
             }}
           >
-            Shape the Fortune, meet AL, and build the creative library behind Roxy’s next job. Every
-            final choice has a place to live.
+            {data.project?.cinematicOnly
+              ? 'Develop Roxy as the Sith Inquisitor. Review the source chapter, audition her British voice, and approve the wardrobe and weapons for a faithful cinematic adaptation.'
+              : 'Shape the Fortune, meet AL, and build the creative library behind Roxy’s next job. Every final choice has a place to live.'}
           </Typography>
           <Stack
             direction="row"
@@ -131,9 +136,25 @@ function Overview({ data, navigate }) {
             `${active.filter((a) => a.scope === 'episode').length} episode-only assets`
           ],
           [
-            pending.length + pendingVideos,
+            pending.length +
+              pendingVideos +
+              (data.workflowReviews ?? []).filter(
+                (row) =>
+                  (row.target.scope !== 'asset' ||
+                    !pending.some((a) => a._id === row.target.recordId)) &&
+                  !(
+                    row.stage === 'visual' &&
+                    data.episodes.some(
+                      (e) =>
+                        e._id === row.target.recordId &&
+                        pendingVideoChoices(e, data.media).some(
+                          ({ clip }) => clip.id === row.target.clipId
+                        )
+                    )
+                  )
+              ).length,
             'Pending choices',
-            'Assets and video clips awaiting your decision'
+            'Asset choices, video clips and production reviews'
           ],
           [data.episodes.length, 'Episodes', 'Stories taking shape'],
           [data.media.length, 'Local files', 'Originals kept on this computer']
@@ -153,6 +174,40 @@ function Overview({ data, navigate }) {
           </Box>
         ))}
       </Box>
+      {data.workflowReviews?.length > 0 && (
+        <Box className="editor-panel">
+          <Typography variant="h2">Production reviews waiting for you</Typography>
+          <Stack spacing={1} sx={{ mt: 2 }}>
+            {data.workflowReviews.map((row) => (
+              <Button
+                component="a"
+                href={
+                  row.stage === 'story-draft'
+                    ? studioUrl('/?episode=' + row.target.recordId) + '#' + row.key
+                    : reviewHref(row.target, row.stage)
+                }
+                key={row.key}
+                sx={{ justifyContent: 'flex-start', textAlign: 'left' }}
+                onClick={(event) => {
+                  if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+                  event.preventDefault();
+                  navigate(
+                    row.target.scope === 'asset' ? 'library' : 'episodes',
+                    row.target.recordId
+                  );
+                  const url = new URL(window.location.href);
+                  url.hash =
+                    row.stage === 'story-draft' ? row.key : reviewAnchor(row.target, row.stage);
+                  window.history.replaceState({}, '', url.pathname + url.search + url.hash);
+                }}
+              >
+                {row.name} · {row.title} ·{' '}
+                {row.status === 'draft' ? 'Needs your review' : row.status.replaceAll('-', ' ')}
+              </Button>
+            ))}
+          </Stack>
+        </Box>
+      )}
       <Stack
         direction="row"
         sx={{
@@ -265,8 +320,10 @@ function Overview({ data, navigate }) {
             Story first. Scenes set the pace.
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            Roughly {data.settings.vlogPercent}% personal vlog, with cinematic dialogue and action
-            filling the rest. Flexible clips, sound effects, and no generated music.
+            {data.settings.vlogPercent === 0
+              ? 'Fully cinematic dialogue and action. Faithful to the recorded source, with no audience-facing vlog dialogue.'
+              : `Roughly ${data.settings.vlogPercent}% personal vlog, with cinematic dialogue and action filling the rest.`}{' '}
+            Flexible clips, native sound effects, and separate music reviews.
           </Typography>
           <Divider
             sx={{
@@ -571,6 +628,32 @@ export default function App({ account }) {
                 <Typography>Opening your production studio…</Typography>
               </Stack>
             )}
+            {data?.projects?.length > 1 && (
+              <Stack spacing={1} sx={{ mb: 3 }}>
+                <TextField
+                  select
+                  fullWidth
+                  label="Project / class storyline"
+                  value={data.project?.key ?? 'imperial-smuggler'}
+                  onChange={(e) => {
+                    const address = new URL(window.location.href);
+                    address.search = '';
+                    address.searchParams.set('project', e.target.value);
+                    window.location.assign(address.href);
+                  }}
+                >
+                  {data.projects.map((project) => (
+                    <MenuItem key={project.key} value={project.key} sx={{ whiteSpace: 'normal' }}>
+                      {project.name}
+                    </MenuItem>
+                  ))}
+                </TextField>
+                <Typography variant="caption" color="text.secondary">
+                  Each storyline has its own episodes, creative choices, voice and continuity. Saved
+                  editor drafts stay in this browser when switching.
+                </Typography>
+              </Stack>
+            )}
             {data && page === 'overview' && (
               <Overview
                 {...{
@@ -581,6 +664,7 @@ export default function App({ account }) {
             )}
             {data && page === 'library' && (
               <AssetLibrary
+                workflowVersion={data.settings?.workflowVersion}
                 key={`library-${initialId}`}
                 assets={data.assets}
                 episodes={data.episodes}
@@ -592,7 +676,11 @@ export default function App({ account }) {
                   navigate('chat');
                 }}
                 onRejected={onRejected}
-                onSaved={(a) => updateRecord('assets', a)}
+                onReload={() => setReload((v) => v + 1)}
+                onSaved={(a) => {
+                  updateRecord('assets', a);
+                  if (data.settings?.workflowVersion === 1) setReload((v) => v + 1);
+                }}
                 onMedia={onMedia}
               />
             )}

@@ -14,6 +14,18 @@ export const imageGenerationDefaults = Object.freeze({
   }
 });
 
+export const videoGenerationDefaults = Object.freeze({
+  provider: 'OpenArt',
+  model: 'wan3-0',
+  displayName: 'Wan 3.0 Standard',
+  resolution: '1080p',
+  width: 1920,
+  height: 1080,
+  aspectRatio: '16:9',
+  automaticUpscale: false
+});
+
+// Historical projects/files can retain their prior 1440p imports.
 export const videoUpscaleDefaults = Object.freeze({
   automaticOnApproval: true,
   provider: 'OpenArt',
@@ -25,4 +37,10 @@ export const videoUpscaleDefaults = Object.freeze({
   frameRate: 30,
   mode: 'Standard',
   preserveOriginal: true
+});
+export const noVideoUpscale = Object.freeze({
+  automaticOnApproval: false,
+  required: false,
+  preserveOriginal: true,
+  message: 'Native 1080p video is used directly; no upscale step.'
 });

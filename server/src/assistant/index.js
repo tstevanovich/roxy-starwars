@@ -2,16 +2,29 @@ import { randomUUID } from 'node:crypto';
 
 import { json, Router } from 'express';
 
-import { StudioAsset, StudioEpisode, StudioMedia } from '../models/Studio.js';
+import { imageRevisionReview } from '../../../shared/asset-image-prompts.js';
+import {
+  mergeAssetProduction,
+  mergeSceneProposal,
+  proposalApplication
+} from '../../../shared/production-proposals.js';
+import { unchangedShotImage } from '../../../shared/shot-revisions.js';
+import { StudioAsset, StudioAutomation, StudioEpisode, StudioMedia } from '../models/Studio.js';
 import { hashToken, readOwner } from '../owner.js';
+import { workflowContext, workflowEnabled } from '../production-workflow.js';
+import { assertMediaAccess } from '../projects.js';
+import { mediaView } from '../studio-media.js';
 import { fail, id, text } from '../studio-validation.js';
+import { createWorkflowAutomation } from '../workflow-automation.js';
 import { createChatEngine } from './chat.js';
 import { createChatGPT } from './chatgpt.js';
 import { Chat, Job, Message, Proposal, Run, SourceGrant } from './models.js';
 import { createOpenArt } from './openart.js';
 import { createProduction, defaultMediaDirectory } from './production.js';
-import { referenceSharing } from './reference-sharing.js';
+import { episodePlan, supersedeEpisodeProposals } from './proposal-input.js';
+import { registerSourceVideo } from './source-capture.js';
 import { createSecretStore } from './store.js';
+import { createStoryQueue } from './story-automation.js';
 
 function jobView(job) {
   const {
@@ -48,7 +61,6 @@ function jobView(job) {
 export function createAssistant({
   mediaDirectory = defaultMediaDirectory,
   ownerPath,
-  remotePath,
   secretDirectory,
   store = createSecretStore(secretDirectory),
   openart = createOpenArt(store, { ownerPath }),
@@ -69,10 +81,12 @@ export function createAssistant({
     store,
     mediaDirectory,
     ownerPath,
-    remotePath,
     fetcher: workerFetch
   });
   const planClient = chatgpt ?? createChatGPT({ store, ownerPath, fetcher: workerFetch });
+  const automation = createWorkflowAutomation(production, {
+    queueStory: createStoryQueue(planClient)
+  });
   const engine = createChatEngine({
     chatgpt: planClient,
     production,
@@ -123,10 +137,12 @@ export function createAssistant({
       chatgpt: await planClient.status(),
       openart: {
         connected: Boolean(secrets.openart?.tokens),
-        referenceSharing: await referenceSharing({
-          redirectUrl: secrets.openart?.redirectUrl,
-          remotePath
-        }),
+        referenceSharing: {
+          ready: Boolean(secrets.openart?.tokens),
+          source: 'OpenArt storage',
+          message:
+            'References are uploaded to OpenArt and verified before rendering. The remote studio tunnel is not used for reference delivery.'
+        },
         projectId: secrets.openart?.projectId ?? 'f6YCUHb5jQKxcO2tP6vm'
       },
       elevenlabs: { configured: Boolean(process.env.ELEVENLABS_API_KEY) }
@@ -222,17 +238,11 @@ export function createAssistant({
   });
   router.post('/connections/openart/test', async (_req, res) => {
     await openart.call('openart_model_form_get', { model: 'wan3-0', mode: 'image2video' });
-    const secrets = await store.read();
-    const sharing = await referenceSharing({
-      redirectUrl: secrets.openart?.redirectUrl,
-      remotePath
-    });
     res.json({
       verified: true,
-      referenceSharing: sharing,
-      message: sharing.ready
-        ? 'OpenArt responded successfully. Secure local-reference sharing is configured.'
-        : 'OpenArt responded successfully. ' + sharing.message
+      referenceSharing: { ready: true, source: 'OpenArt storage' },
+      message:
+        'OpenArt responded successfully. References are uploaded and verified in OpenArt storage before rendering.'
     });
   });
   router.put('/connections/openart', async (req, res) => {
@@ -259,6 +269,26 @@ export function createAssistant({
       .lean();
     res.json({ jobs: jobs.map(jobView) });
   });
+  router.get('/music', async (req, res) => res.json(await production.music.status(req.query)));
+  router.post('/source-video', async (req, res) =>
+    res.json({
+      media: mediaView(await registerSourceVideo(req.body, { mediaDirectory })),
+      message:
+        'Source video saved with its original-video timestamp mapping. Production chat can now capture frames from this copy.'
+    })
+  );
+  for (const [action, method] of [
+    ['plan', 'plan'],
+    ['generate', 'queue'],
+    ['reject', 'reject']
+  ])
+    router.post('/music/' + action, async (req, res) => {
+      const result = await production.music[method](req.body);
+      res
+        .status(action === 'generate' ? 202 : 200)
+        .json({ ...result, job: result.job ? jobView(result.job) : undefined });
+      if (action === 'generate') void kick();
+    });
   for (const [action, method] of [
     ['generate', 'queueSound'],
     ['import', 'importSound'],
@@ -280,13 +310,19 @@ export function createAssistant({
       fail('Asset not found.');
     if (context.episodeId && !(await StudioEpisode.exists({ _id: id(context.episodeId) })))
       fail('Episode not found.');
+    if (context.packageItemId) {
+      const asset = context.assetId && (await StudioAsset.findById(context.assetId).lean());
+      if (!asset?.production?.items?.some((item) => item.id === context.packageItemId))
+        fail('Reference package item not found.');
+    }
     const chat = await Chat.create({
       title: text(req.body.title || 'Production conversation', 'Title', 160, true),
       context: {
         assetId: context.assetId,
         episodeId: context.episodeId,
         sceneId: context.sceneId,
-        clipId: context.clipId
+        clipId: context.clipId,
+        packageItemId: context.packageItemId
       }
     });
     res.status(201).json({ chat: chat.toObject() });
@@ -300,9 +336,38 @@ export function createAssistant({
       Job.find({ chatId: chat._id }).sort({ createdAt: -1 }).limit(100).lean(),
       Proposal.find({ chatId: chat._id }).sort({ createdAt: -1 }).limit(100).lean()
     ]);
-    res.json({ chat, messages, runs, jobs: jobs.map(jobView), proposals });
+    const episodes = await StudioEpisode.find({
+      _id: { $in: proposals.map((p) => p.episodeId).filter(Boolean) }
+    }).lean();
+    const assets = await StudioAsset.find({
+      _id: { $in: proposals.map((p) => p.assetId).filter(Boolean) }
+    }).lean();
+    res.json({
+      chat,
+      messages,
+      media: (
+        await StudioMedia.find({ _id: { $in: messages.flatMap((m) => m.mediaIds ?? []) } }).lean()
+      ).map(mediaView),
+      runs,
+      jobs: jobs.map(jobView),
+      proposals: proposals.map((proposal) => {
+        const record = proposal.assetId
+          ? assets.find((a) => String(a._id) === proposal.assetId)
+          : episodes.find((e) => String(e._id) === proposal.episodeId);
+        return proposal.scene || proposal.render || proposal.production
+          ? {
+              ...proposal,
+              application: {
+                ...proposalApplication(proposal, record),
+                recordRevision: record?.revision
+              }
+            }
+          : proposal;
+      })
+    });
   });
   router.post('/chats/:id/messages', async (req, res) => {
+    if (!(await Chat.exists({ _id: id(req.params.id) }))) fail('Conversation not found.', 404);
     const chatId = id(req.params.id),
       requestId = text(req.body.requestId, 'Message request ID', 100, true);
     const previous = await Message.findOne({ requestId }).lean();
@@ -314,6 +379,7 @@ export function createAssistant({
     const mediaIds = req.body.mediaIds ?? [];
     if (!Array.isArray(mediaIds) || mediaIds.length > 4) fail('Attach up to four saved files.');
     mediaIds.forEach(id);
+    await assertMediaAccess(mediaIds);
     if (
       (await StudioMedia.countDocuments({ _id: { $in: [...new Set(mediaIds)] } })) !==
       new Set(mediaIds).size
@@ -358,12 +424,91 @@ export function createAssistant({
   router.post('/proposals/:id/apply', async (req, res) => {
     const proposal = await Proposal.findById(id(req.params.id)).lean();
     if (!proposal || proposal.status !== 'pending') fail('This draft is no longer pending.', 409);
-    const episode = await StudioEpisode.findById(proposal.episodeId).lean();
-    if (!episode || episode.revision !== proposal.baseRevision)
-      fail(
-        'The episode changed. Ask the assistant to revise this draft against the latest saved episode.',
-        409
+    if (proposal.render)
+      fail('Use Approve revision & generate video to authorize this video request.', 409);
+    if (proposal.production) {
+      const Model = proposal.scope === 'asset' ? StudioAsset : StudioEpisode;
+      const record = await Model.findById(
+        proposal.scope === 'asset' ? proposal.assetId : proposal.episodeId
+      ).lean();
+      const assetPlan = proposal.scope === 'asset';
+      if (!record) fail('The saved plan record is missing.', 409);
+      if (assetPlan) {
+        const application = proposalApplication(proposal, record);
+        if (!application.canApply) fail(application.reason, 409);
+      } else if (record.revision !== proposal.baseRevision)
+        fail('The record changed. Request a revised plan against the latest saved version.', 409);
+      const production = assetPlan ? mergeAssetProduction(proposal, record) : proposal.production;
+      await assertMediaAccess([
+        ...(production.sourceMediaIds ?? []),
+        ...(production.items ?? [])
+          .flatMap((item) => [item.mediaId, ...(item.referenceMediaIds ?? [])])
+          .filter(Boolean)
+      ]);
+      const revisionItems = [];
+      if (assetPlan && workflowEnabled()) {
+        const context = await workflowContext();
+        const briefApproved =
+          context.evaluate({ scope: 'asset', recordId: String(record._id) }, 'brief').status ===
+          'approved';
+        production.items = production.items.map((item) => {
+          const previous = record.production?.items?.find((i) => i.id === item.id);
+          const revised = briefApproved ? imageRevisionReview(previous, item) : item;
+          if (revised !== item) {
+            revisionItems.push(item.id);
+          }
+          return revised;
+        });
+      }
+      const old = { ...record };
+      delete old.history;
+      const plan =
+        proposal.scope === 'episode'
+          ? episodePlan(record, proposal)
+          : {
+              production
+            };
+      const result = await Model.updateOne(
+        { _id: record._id, revision: record.revision },
+        {
+          $set: plan,
+          ...(proposal.scope === 'episode' && proposal.supportingNotes?.length
+            ? {
+                $addToSet: {
+                  researchNotes: {
+                    $each: proposal.supportingNotes.map((n) => ({
+                      ...n,
+                      draftId: String(proposal._id)
+                    }))
+                  }
+                }
+              }
+            : {}),
+          $inc: { revision: 1 },
+          $push: { history: { $each: [{ ...old, savedAt: new Date() }], $slice: -30 } }
+        }
       );
+      if (!result.modifiedCount) fail('The record changed while applying this plan.', 409);
+      await Proposal.updateOne({ _id: proposal._id }, { $set: { status: 'applied' } });
+      await supersedeEpisodeProposals(proposal, record);
+      return res.json({
+        applied: true,
+        episodeId: proposal.episodeId,
+        assetId: proposal.assetId,
+        ...(revisionItems.length
+          ? {
+              nextReview: {
+                target: { scope: 'asset', recordId: proposal.assetId },
+                stage: 'reference-plan:' + revisionItems[0],
+                title: 'Reference revision directions'
+              }
+            }
+          : {})
+      });
+    }
+    const episode = await StudioEpisode.findById(proposal.episodeId).lean();
+    const application = proposalApplication(proposal, episode);
+    if (!application.canApply) fail(application.reason, 409);
     const old = { ...episode };
     delete old.history;
     let fields;
@@ -371,7 +516,7 @@ export function createAssistant({
       fields = {
         scenes: episode.scenes.some((s) => s.id === proposal.scene.id)
           ? episode.scenes.map((s) =>
-              s.id === proposal.scene.id ? { ...proposal.scene, approval: null } : s
+              s.id === proposal.scene.id ? mergeSceneProposal(proposal.scene, s) : s
             )
           : [...episode.scenes, { ...proposal.scene, approval: null }]
       };
@@ -384,16 +529,30 @@ export function createAssistant({
         )
       };
     const result = await StudioEpisode.updateOne(
-      { _id: episode._id, revision: proposal.baseRevision },
+      { _id: episode._id, revision: episode.revision },
       {
         $set: fields,
+        ...(proposal.supportingNotes?.length
+          ? {
+              $addToSet: {
+                researchNotes: {
+                  $each: proposal.supportingNotes.map((n) => ({
+                    ...n,
+                    draftId: String(proposal._id),
+                    sceneId: proposal.scene?.id ?? null
+                  }))
+                }
+              }
+            }
+          : {}),
         $inc: { revision: 1 },
         $push: { history: { $each: [{ ...old, savedAt: new Date() }], $slice: -30 } }
       }
     );
     if (!result.modifiedCount) fail('The episode changed while applying this draft.', 409);
     if (proposal.scene) {
-      // A revised scene's previous images need an explicit fresh decision before another video.
+      const previous = episode.scenes.find((s) => s.id === proposal.scene.id);
+      // A sound-only plan must not reopen approved image decisions.
       const shots = await StudioAsset.find({
         episodeId: episode._id,
         sceneId: proposal.scene.id,
@@ -401,6 +560,7 @@ export function createAssistant({
         finalChoice: { $ne: null }
       }).lean();
       for (const shot of shots) {
+        if (unchangedShotImage(previous, proposal.scene, shot.clipId)) continue;
         const snapshot = { ...shot };
         delete snapshot.history;
         await StudioAsset.updateOne(
@@ -427,6 +587,10 @@ export function createAssistant({
     );
     res.json({ dismissed: true });
   });
+  router.post('/proposals/:id/approve-render', async (req, res) => {
+    const job = await req.app.locals.assistant.production.approveRevision(id(req.params.id));
+    res.json({ approved: true, job: jobView(job) });
+  });
   router.post('/jobs/:id/cancel', async (req, res) => {
     const result = await Job.updateOne(
       { _id: id(req.params.id), status: 'queued' },
@@ -446,6 +610,7 @@ export function createAssistant({
         { sort: { createdAt: 1 }, returnDocument: 'after' }
       ).lean();
       if (run) await engine.run(run);
+      await automation.processNext();
       // Due polls must not continually outrank newer, unsubmitted requests.
       const job =
         (await Job.findOne({ status: { $in: ['queued', 'importing'] } })
@@ -475,11 +640,31 @@ export function createAssistant({
     router,
     publicRouter,
     production,
+    automation,
     engine,
     chatgpt: planClient,
     store,
     async start() {
       stopped = false;
+      for (const proposal of await Proposal.find({
+        status: 'approving',
+        render: { $exists: true }
+      }).lean()) {
+        const job = await Job.findOne({
+          requestId: `approved-video-revision-${proposal._id}`
+        }).lean();
+        await Proposal.updateOne(
+          { _id: proposal._id, status: 'approving' },
+          job
+            ? {
+                $set: { status: 'applied', 'render.jobId': String(job._id) }
+              }
+            : {
+                $set: { status: 'pending' },
+                $unset: { 'render.approvedAt': '', 'render.approvedSnapshot': '' }
+              }
+        );
+      }
       for (const run of await Run.find({ status: 'preparing' }).lean()) {
         const saved = await Message.exists({ runId: String(run._id) });
         await Run.updateOne(
@@ -520,6 +705,8 @@ export function createAssistant({
         }
       );
       await Job.updateMany({ status: 'preparing' }, { $set: { status: 'queued' } });
+      await StudioAutomation.updateMany({ status: 'running' }, { $set: { status: 'queued' } });
+      await automation.reconcilePlanning();
       timer = setInterval(() => void kick(), 2500);
       timer.unref();
       void kick();

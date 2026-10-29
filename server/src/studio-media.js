@@ -5,6 +5,7 @@ import { extname, join } from 'node:path';
 import express from 'express';
 
 import { StudioMedia } from './models/Studio.js';
+import { assertMediaAccess } from './projects.js';
 import { rejectMedia } from './studio-reject-media.js';
 import { fail, id } from './studio-validation.js';
 
@@ -52,7 +53,15 @@ export function mediaView(media) {
   const record = { ...media };
   delete record.filename;
   delete record.providerReference;
-  return { ...record, url: `/api/studio/media/${media._id}` };
+  delete record.providerUpload;
+  return {
+    ...record,
+    url:
+      `/api/studio/media/${media._id}` +
+      (media.projectKey && media.projectKey !== 'imperial-smuggler'
+        ? `?project=${encodeURIComponent(media.projectKey)}`
+        : '')
+  };
 }
 export async function saveGeneratedMedia(directory, buffer, originalName, extra = {}) {
   const format = formats[extname(originalName).toLowerCase()];
@@ -132,6 +141,7 @@ export function mediaRouter(directory) {
   router.get('/:id', async (req, res, next) => {
     const media = await StudioMedia.findById(id(req.params.id)).lean();
     if (!media) fail('Media not found.', 404);
+    await assertMediaAccess([req.params.id]);
     res.set('X-Content-Type-Options', 'nosniff');
     if (req.query.download === '1') res.attachment(media.originalName);
     res.type(media.mime);
