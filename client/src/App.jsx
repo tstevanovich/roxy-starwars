@@ -154,7 +154,7 @@ function Overview({ data, navigate }) {
                   )
               ).length,
             'Pending choices',
-            'Asset choices, video clips and production reviews'
+            'Results ready for approval; production can still be incomplete'
           ],
           [data.episodes.length, 'Episodes', 'Stories taking shape'],
           [data.media.length, 'Local files', 'Originals kept on this computer']
@@ -174,6 +174,29 @@ function Overview({ data, navigate }) {
           </Box>
         ))}
       </Box>
+      {!pending.length &&
+        !pendingVideos &&
+        !data.workflowReviews?.length &&
+        data.episodes.some(
+          (episode) => episode.workflowVersion === 1 && !episode.workflowReady
+        ) && (
+          <Alert severity="info" role="status">
+            No results are ready for approval. Production is still incomplete. Missing work is
+            prepared automatically; the episode board shows its progress, required reviews and
+            provider errors.
+            {data.episodes
+              .filter((episode) => episode.workflowVersion === 1 && !episode.workflowReady)
+              .map((episode) => (
+                <Button
+                  component="a"
+                  key={episode._id}
+                  href={studioUrl('/?episode=' + episode._id) + '#production-approval-board'}
+                >
+                  Open production status for {episode.title}
+                </Button>
+              ))}
+          </Alert>
+        )}
       {data.workflowReviews?.length > 0 && (
         <Box className="editor-panel">
           <Typography variant="h2">Production reviews waiting for you</Typography>

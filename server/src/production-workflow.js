@@ -1,9 +1,12 @@
 import { createHash } from 'node:crypto';
 
+import { animaticTimingIssue } from '../../shared/animatic-timing.js';
 import { hasNativeAudio } from '../../shared/audio-policy.js';
 import { characterPackageLayout } from '../../shared/character-package.js';
 import { continuityInput, shotContinuity } from '../../shared/shot-continuity.js';
 import { ambiguousSceneLocation } from '../../shared/shot-setting.js';
+import { soundPlanReviewInput } from '../../shared/sound-plan-review.js';
+import { motionInput } from '../../shared/video-readiness.js';
 import { Job } from './assistant/models.js';
 import {
   StudioAsset,
@@ -42,7 +45,9 @@ export async function workflowContext() {
     Job.find()
       .sort({ createdAt: -1 })
       .limit(100)
-      .select('kind title target status error quote receipt.creditsCharged createdAt')
+      .select(
+        'kind title target status error quote receipt.creditsCharged createdAt resultAssetId resultMediaIds snapshot.transition snapshot.imageIds snapshot.characterReferences settings.mode'
+      )
       .lean(),
     StudioMusicCue.find().lean()
   ]);
@@ -51,7 +56,7 @@ export async function workflowContext() {
 
 export function evaluateWorkflow(
   { assets, episodes, media, reviews, jobs = [], musicCues = [] },
-  { retainApprovals = true } = {}
+  { retainApprovals = true, legacySoundPlanDependencies = false } = {}
 ) {
   const mediaMap = new Map(media.map((m) => [String(m._id), m]));
   const reviewMap = new Map(reviews.map((r) => [r.targetKey, r]));
@@ -89,7 +94,18 @@ export function evaluateWorkflow(
       valid = true,
       coveredByScene = false;
     const deps = [],
-      reasons = [];
+      reasons = [],
+      timingIssues = [];
+    const checkTiming = (c) => {
+      const issue = animaticTimingIssue(
+        c,
+        mediaMap.get(String(c.selectedDialogueId))?.durationSeconds
+      );
+      if (issue) {
+        timingIssues.push(issue);
+        need(false, issue.message);
+      }
+    };
     const depend = (t, s) => {
       const result = evaluate(t, s);
       deps.push(result);
@@ -146,7 +162,10 @@ export function evaluateWorkflow(
           id: item.id,
           notes: item.notes,
           ...(item.imagePrompt ? { imagePrompt: item.imagePrompt } : {}),
-          ...(item.referenceMediaIds?.length ? { referenceMediaIds: item.referenceMediaIds } : {})
+          ...(item.referenceMediaIds?.length ? { referenceMediaIds: item.referenceMediaIds } : {}),
+          ...(item.imageReferenceMediaIds !== undefined
+            ? { imageReferenceMediaIds: item.imageReferenceMediaIds }
+            : {})
         };
         need(
           Boolean(item.imagePrompt?.trim() || item.notes?.trim()),
@@ -318,6 +337,7 @@ export function evaluateWorkflow(
           sound: c.soundEffects,
           plan: {
             ...continuityInput(c.production),
+            ...motionInput(c.production),
             ...(c.production?.location ||
             c.production?.environment ||
             c.production?.physicalConstraints
@@ -389,26 +409,18 @@ export function evaluateWorkflow(
               file(image.finalChoice.mediaIds[0], 'image'),
             `Approve one composition for ${c.title}.`
           );
-          if (stage === 'animatic' && c.dialogue?.trim())
+          if (stage === 'animatic' && c.dialogue?.trim()) {
             need(
               file(c.selectedDialogueId, 'audio'),
               `Choose the dialogue performance for ${c.title}.`
             );
+            checkTiming(c);
+          }
         }
       } else if (stage === 'sound-plan') {
         title = 'Sound plan';
         depend(sceneTarget, 'shot-plan');
-        input = {
-          plan: scene.soundPlan,
-          shots: scene.clips.map((c) => ({ id: c.id, duration: c.duration, sound: c.soundEffects }))
-        };
-        if (input.plan) {
-          input.plan = {
-            ...input.plan,
-            layers: input.plan.layers?.map(({ assetId: _assetId, ...layer }) => layer)
-          };
-          delete input.plan.approval;
-        }
+        input = soundPlanReviewInput(scene, { legacy: legacySoundPlanDependencies });
         need(
           scene.soundPlan?.layers?.length > 0,
           'Plan ambience and effects before generating video.'
@@ -480,7 +492,8 @@ export function evaluateWorkflow(
             a.sceneId === scene.id &&
             a.clipId === clip.id
         );
-        need(evaluate(sceneTarget, 'shot-plan').status === 'approved', 'Approve Shot plan.');
+        // The owner reviews this shot's plan with its image and timed preview.
+        // Editing another shot must not require a new scene-wide plan approval.
         if (stage === 'storyboard') depend(sceneTarget, 'references');
         else depend(target, 'storyboard');
         input = {
@@ -493,6 +506,7 @@ export function evaluateWorkflow(
             camera: clip.camera,
             plan: {
               ...continuityInput(clip.production),
+              ...motionInput(clip.production),
               location: clip.production?.location,
               environment: clip.production?.environment,
               physicalConstraints: clip.production?.physicalConstraints,
@@ -518,11 +532,13 @@ export function evaluateWorkflow(
             file(image.finalChoice.mediaIds[0], 'image'),
           `Approve one composition for ${clip.title}.`
         );
-        if (stage === 'animatic' && clip.dialogue?.trim())
+        if (stage === 'animatic' && clip.dialogue?.trim()) {
           need(
             file(clip.selectedDialogueId, 'audio'),
             `Choose the dialogue performance for ${clip.title}.`
           );
+          checkTiming(clip);
+        }
         // A current whole-scene review already covers this clip. Independent
         // clip reviews remain usable when a different shot is unfinished.
         coveredByScene = evaluate(sceneTarget, stage).status === 'approved';
@@ -610,7 +626,47 @@ export function evaluateWorkflow(
       target.scope === 'clip'
         ? clipApprovalInputs({ episode: parent, scene, clip, assets, media }, stage)
         : null;
-    const approvalFingerprint = scoped ? approvalHash(scoped.input) : null;
+    const sceneScoped =
+      target.scope === 'scene' &&
+      [
+        'script',
+        'references',
+        'shot-plan',
+        'sound-plan',
+        'storyboard',
+        'animatic',
+        'music-plan',
+        'music'
+      ].includes(stage);
+    const approvalFingerprint = scoped
+      ? approvalHash(scoped.input)
+      : sceneScoped
+        ? approvalHash({
+            stage,
+            input,
+            dependencies: deps
+              .filter(
+                (d) =>
+                  !(stage === 'script' && d.target.scope === 'episode' && d.stage === 'outline') &&
+                  !(
+                    stage === 'sound-plan' &&
+                    !legacySoundPlanDependencies &&
+                    d.stage === 'shot-plan'
+                  )
+              )
+              .map((d) => ({ key: d.key, fingerprint: d.approvalFingerprint ?? d.fingerprint })),
+            ...(stage === 'script'
+              ? {
+                  sourceReferences: (parent.sourceReferences ?? []).filter((ref) =>
+                    scene.sourceReferenceIds?.includes(ref.id)
+                  ),
+                  decisions: (parent.decisions ?? []).filter((decision) =>
+                    scene.sourceReferenceIds?.includes(decision.sourceId)
+                  )
+                }
+              : {})
+          })
+        : null;
     const batch =
       scoped && ['storyboard', 'animatic'].includes(stage)
         ? reviewMap.get(reviewKey(sceneTarget, stage))
@@ -624,6 +680,20 @@ export function evaluateWorkflow(
         new Date(review.reviewedAt) >= new Date(batch.reviewedAt)
       );
     let retained = false;
+    if (
+      retainApprovals &&
+      sceneScoped &&
+      review?.state === 'approved' &&
+      review.approvalFingerprint === approvalFingerprint
+    )
+      retained =
+        valid &&
+        deps.every(
+          (d) =>
+            (stage === 'script' && d.target.scope === 'episode' && d.stage === 'outline') ||
+            (stage === 'sound-plan' && d.stage === 'shot-plan') ||
+            d.status === 'approved'
+        );
     if (
       retainApprovals &&
       scoped &&
@@ -651,6 +721,7 @@ export function evaluateWorkflow(
         imageReady &&
         (stage === 'storyboard' ||
           (stage === 'animatic' &&
+            !timingIssues.length &&
             evaluate(target, 'storyboard').status === 'approved' &&
             (!clip.dialogue?.trim() || file(clip.selectedDialogueId, 'audio'))) ||
           (stage === 'visual' &&
@@ -666,7 +737,10 @@ export function evaluateWorkflow(
         parent.sheetLayout === characterPackageLayout &&
         stage === 'reference:body-turnaround');
     const current = review?.fingerprint === fingerprint;
-    const covered = coveredByScene && !(current && review?.state !== 'approved');
+    const feedbackCurrent =
+      current ||
+      Boolean(review?.contentFingerprint && review.contentFingerprint === approvalFingerprint);
+    const covered = coveredByScene && !(feedbackCurrent && review?.state !== 'approved');
     const status = retained
       ? 'approved'
       : automatic
@@ -677,7 +751,7 @@ export function evaluateWorkflow(
           ? 'approved'
           : review?.state === 'approved'
             ? 'needs-review'
-            : current && review?.state === 'changes-requested'
+            : feedbackCurrent && review?.state === 'changes-requested'
               ? 'needs-changes'
               : blocked.length
                 ? 'blocked'
@@ -702,17 +776,18 @@ export function evaluateWorkflow(
             : 'unapprove'
         : null,
       savedAt: review?.reviewedAt ?? null,
-      feedbackIsCurrent: current,
+      feedbackIsCurrent: feedbackCurrent,
       ...(approvalFingerprint ? { approvalFingerprint } : {}),
       ...(retained && (!current || !valid || blocked.length) ? { retainedApproval: true } : {}),
       canApprove: valid && !blocked.length && !automatic,
       automatic,
+      ...(timingIssues.length ? { timingIssues } : {}),
       prerequisites: [
         ...new Map(
           [
             ...blocked,
-            ...(scoped && ['storyboard', 'animatic', 'visual'].includes(stage)
-              ? (stage === 'visual' ? ['sound-plan'] : ['script', 'shot-plan'])
+            ...(scoped && stage === 'visual'
+              ? ['sound-plan']
                   .map((s) => evaluate(sceneTarget, s))
                   .filter((r) => r.status !== 'approved')
               : [])
@@ -751,15 +826,16 @@ export async function imageWorkflow(asset, packageItemId) {
   if (asset.production?.items?.find((item) => item.id === packageItemId)?.requiresPlanApproval)
     token = hash([token, await requireWorkflow(target, 'reference-plan:' + packageItemId)]);
   const item = asset.production?.items?.find((entry) => entry.id === packageItemId);
-  if (item?.referenceMediaIds?.length) {
+  const selectedReferences = item?.imageReferenceMediaIds ?? item?.referenceMediaIds ?? [];
+  if (selectedReferences.length) {
     const hashes = [];
-    for (const mid of item.referenceMediaIds) {
+    for (const mid of selectedReferences) {
       const reference = asset.production.items.find(
         (entry) => entry.mediaId === mid && entry.id !== item.id && entry.type === 'image'
       );
-      if (!reference)
+      if (!reference && item.imageReferenceMediaIds === undefined)
         fail('Choose approved images from other items in this production package.', 409);
-      hashes.push(await requireWorkflow(target, 'reference:' + reference.id));
+      if (reference) hashes.push(await requireWorkflow(target, 'reference:' + reference.id));
     }
     token = hash([token, hashes]);
   }
@@ -774,13 +850,18 @@ export async function imageWorkflow(asset, packageItemId) {
     packageItemId &&
     ['character', 'droid'].includes(asset.kind) &&
     asset.sheetLayout === characterPackageLayout &&
-    packageItemId !== 'master-portrait'
+    packageItemId !== 'master-portrait' &&
+    (item?.imageReferenceMediaIds === undefined ||
+      item.imageReferenceMediaIds.includes(
+        String(asset.production.items.find((entry) => entry.id === 'master-portrait')?.mediaId)
+      ))
   )
     return hash([token, await requireWorkflow(target, 'reference:master-portrait')]);
   return token;
 }
 export async function shotWorkflow(episode, scene, kind, clip) {
   if (!workflowEnabled()) return null;
+  await requireWorkflow({ scope: 'episode', recordId: String(episode._id) }, 'outline');
   const target = { scope: 'scene', recordId: String(episode._id), sceneId: scene.id };
   const stage = kind === 'video' ? 'animatic' : kind === 'image' ? 'references' : 'script';
   return hash([

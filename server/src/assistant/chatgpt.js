@@ -718,6 +718,10 @@ export function createChatGPT({ store, ownerPath, fetcher = fetch, clock = Date.
       const profile = await access(profileId);
       if (!profile.models?.some((m) => m.id === model))
         throw safeError('Choose an available ChatGPT model in Connections.', 409);
+      const requestSignal = AbortSignal.any([
+        AbortSignal.timeout(180000),
+        ...(signal ? [signal] : [])
+      ]);
       try {
         const response = await fetcher(resource + '/responses', {
           method: 'POST',
@@ -731,6 +735,9 @@ export function createChatGPT({ store, ownerPath, fetcher = fetch, clock = Date.
             model,
             store: false,
             stream: true,
+            // Interactive production edits should not silently inherit the
+            // model's slower default reasoning level.
+            ...(/^gpt-6(?:\.|-)/.test(model) ? { reasoning: { effort: 'low' } } : {}),
             instructions,
             input,
             include: ['reasoning.encrypted_content'],
@@ -748,7 +755,7 @@ export function createChatGPT({ store, ownerPath, fetcher = fetch, clock = Date.
                 }
               : {})
           }),
-          signal: AbortSignal.any([AbortSignal.timeout(180000), ...(signal ? [signal] : [])])
+          signal: requestSignal
         });
         const result = await completedResponse(response, { onText });
         const current = await store.read();
@@ -767,11 +774,33 @@ export function createChatGPT({ store, ownerPath, fetcher = fetch, clock = Date.
         );
         return result;
       } catch (error) {
-        if (error.providerCode)
-          await updateProfile(profile.id, (p) =>
-            p.tokenVersion === profile.tokenVersion ? { ...p, lastError: error.providerCode } : p
+        let failure = error;
+        if (
+          !error.status &&
+          (error.name === 'TimeoutError' || requestSignal.reason?.name === 'TimeoutError')
+        )
+          failure = safeError(
+            'ChatGPT took longer than three minutes to complete this reply. Your message is saved. Try the request again; reconnecting is not required for a timeout. Any earlier completed actions remain listed below.',
+            504,
+            'response_timeout'
           );
-        throw error;
+        else if (!error.status && (error.name === 'AbortError' || signal?.aborted))
+          failure = safeError(
+            'This reply was interrupted while the studio was stopping. Your message is saved; try again when the studio is available.',
+            503,
+            'request_interrupted'
+          );
+        else if (!error.status && error instanceof TypeError)
+          failure = safeError(
+            'The connection to ChatGPT was interrupted. Your message is saved. Try again; check Connections only if the interruption continues.',
+            502,
+            'transport_error'
+          );
+        if (failure.providerCode)
+          await updateProfile(profile.id, (p) =>
+            p.tokenVersion === profile.tokenVersion ? { ...p, lastError: failure.providerCode } : p
+          );
+        throw failure;
       }
     },
     async disconnect(profileId) {

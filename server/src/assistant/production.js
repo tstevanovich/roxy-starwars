@@ -3,10 +3,18 @@ import { readdir, readFile } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { packageImagePrompt } from '../../../shared/asset-image-prompts.js';
+import { animaticTimingIssue } from '../../../shared/animatic-timing.js';
+import { packageImagePrompt, visualImageDirections } from '../../../shared/asset-image-prompts.js';
 import { nativeAudioPolicy } from '../../../shared/audio-policy.js';
+import { imageReferenceItems, imageReferenceSelection } from '../../../shared/image-references.js';
 import { videoGenerationDefaults } from '../../../shared/production-defaults.js';
 import { proposalApplication } from '../../../shared/production-proposals.js';
+import { withImageReferencePrompt } from '../../../shared/reference-prompt.js';
+import { cleanRenderPrompt } from '../../../shared/render-prompt.js';
+import { shotAssetIds } from '../../../shared/shot-references.js';
+import { shotTransition } from '../../../shared/shot-transitions.js';
+import { videoCharacterReferences } from '../../../shared/video-cast.js';
+import { dialogueDuration } from '../animatic-timing.js';
 import { StudioAsset, StudioEpisode, StudioMedia } from '../models/Studio.js';
 import { imageWorkflow, shotWorkflow, workflowEnabled } from '../production-workflow.js';
 import { activeProject, legacyProjectKey, projectEra } from '../project-context.js';
@@ -15,11 +23,13 @@ import { approvedSoundPlan } from '../sound-design.js';
 import { saveGeneratedMedia } from '../studio-media.js';
 import { clipPrompts, productionVideoPrompt } from '../studio-prompts.js';
 import { fail, id, sceneFingerprint, text } from '../studio-validation.js';
+import { dialogueCast } from './dialogue.js';
 import { Job, Proposal, SourceGrant } from './models.js';
 import { createMusicProduction } from './music-production.js';
 import { createReferenceStorage } from './reference-storage.js';
 import { assertNoPendingRevision } from './render-revisions.js';
 import { createSoundProduction } from './sound-production.js';
+import { createVoiceProduction } from './voice-production.js';
 
 export const defaultMediaDirectory = fileURLToPath(
   new URL('../../../.data/media/', import.meta.url)
@@ -29,11 +39,18 @@ const stable = (value) => JSON.stringify(value);
 const digest = (value) => createHash('sha256').update(stable(value)).digest('hex');
 export function speakerVoice(clip, assets) {
   const match = clip.dialogue?.match(/^\s*([^:]+):\s*([\s\S]+)$/);
-  if (!match || /\n\s*[A-Z][A-Z -]+:/.test(match[2]))
-    fail('Dialogue generation requires one speaker per clip.');
+  if (!match) fail('Dialogue generation requires one speaker per clip.');
   const speaker = match[1].trim().toLowerCase();
   if (!/^[a-z][a-z0-9 '-]{0,79}$/.test(speaker))
     fail('Use the finalized character’s speaker name.');
+  const spokenText = match[2].replace(
+    /^[ \t]*([A-Za-z][A-Za-z0-9 '-]{0,79}):[ \t]*/gm,
+    (_label, name) => {
+      if (name.trim().toLowerCase() !== speaker)
+        fail('Dialogue generation requires one speaker per clip.');
+      return '';
+    }
+  );
   const firstName = /^(al|al-1b)$/.test(speaker) ? 'al' : speaker.split(' ')[0];
   const namePattern = new RegExp('\\b' + firstName + '\\b', 'i');
   const voice = assets.find(
@@ -45,7 +62,7 @@ export function speakerVoice(clip, assets) {
   );
   if (!voice || voice.finalChoice.voiceModel !== 'eleven_v3')
     fail('Finalize this speaker’s Eleven v3 voice first.');
-  return { voice, spokenText: match[2].replace(/\bAL\b/g, 'Al') };
+  return { voice, spokenText: spokenText.replace(/\bAL\b/g, 'Al') };
 }
 export async function renderTarget(target, kind, revisionProposalId) {
   const assets = await StudioAsset.find({ archived: { $ne: true } }).lean();
@@ -67,7 +84,9 @@ export async function renderTarget(target, kind, revisionProposalId) {
       (!scene.approval || scene.approval.fingerprint !== sceneFingerprint(scene, assets))
     )
       fail('Approve the current scene script before requesting production assets.');
-    const linked = assets.filter((a) => scene.assetIds.map(String).includes(String(a._id)));
+    const linked = assets.filter((a) =>
+      shotAssetIds(scene, clip, assets).map(String).includes(String(a._id))
+    );
     if (linked.some((a) => !a.finalChoice || a.reviewStatus === 'pending-choice'))
       fail('Finalize the scene’s linked references first.');
     const shot = assets.find(
@@ -97,13 +116,61 @@ export async function renderTarget(target, kind, revisionProposalId) {
     if (kind === 'video' && clip.dialogue?.trim() && !clip.selectedDialogueId)
       fail('Choose the ElevenLabs dialogue performance before generating video.');
     if (kind === 'video') approvedSoundPlan(scene, assets);
+    const videoMedia =
+      kind === 'video' ? await StudioMedia.find().select('_id kind sha256').lean() : [];
+    const characterReferences =
+      kind === 'video'
+        ? videoCharacterReferences(episode._id, scene, clip, assets, videoMedia, episode.scenes)
+        : [];
+    const transition =
+      kind === 'video'
+        ? shotTransition(episode._id, scene, clip, assets, videoMedia, episode.scenes)
+        : null;
+    if (transition?.errors.length) fail(transition.errors.join(' '), 409);
+    const transitionFiles = transition
+      ? await StudioMedia.find({ _id: { $in: transition.imageIds }, kind: 'image' })
+          .select('_id sha256')
+          .lean()
+      : [];
+    if (transition && transitionFiles.length !== new Set(transition.imageIds).size)
+      fail(
+        'A transition reference image is missing. Review the shot images before generating.',
+        409
+      );
     const prompts = clipPrompts(scene, clip, assets, episode);
     if (kind === 'image' && prompts.continuity.errors.length)
       fail(prompts.continuity.errors.join(' '), 409);
     const snapshot = {
+      ...(kind === 'image' || kind === 'video'
+        ? {
+            renderPrompt:
+              kind === 'video'
+                ? productionVideoPrompt(scene, clip, '', { characterReferences })
+                : prompts.image
+          }
+        : {}),
       ...(workflowEnabled() ? { workflow: await shotWorkflow(episode, scene, kind, clip) } : {}),
       fingerprint: sceneFingerprint(scene, assets),
       imageIds,
+      ...(characterReferences.length
+        ? {
+            characterReferences: characterReferences.map((reference) => ({
+              ...reference,
+              sha: videoMedia.find((file) => String(file._id) === reference.mediaId)?.sha256
+            }))
+          }
+        : {}),
+      ...(transition
+        ? {
+            transition: {
+              ...transition,
+              files: transition.imageIds.map((mid) => ({
+                id: mid,
+                sha: transitionFiles.find((file) => String(file._id) === mid)?.sha256
+              }))
+            }
+          }
+        : {}),
       dialogueId: clip.selectedDialogueId ? String(clip.selectedDialogueId) : null
     };
     if (kind === 'image' && prompts.continuity.sources.length)
@@ -115,8 +182,8 @@ export async function renderTarget(target, kind, revisionProposalId) {
       snapshot.audioPolicy = nativeAudioPolicy;
       if (episode.videoPass?.id) snapshot.videoPassId = episode.videoPass.id;
     }
-    const speaker = kind === 'dialogue' ? speakerVoice(clip, assets) : null;
-    if (speaker) snapshot.voice = speaker.voice.finalChoice;
+    const speaker = kind === 'dialogue' ? dialogueCast(clip, assets) : null;
+    if (speaker) snapshot.voices = speaker.voices;
     return { episode, scene, clip, shot, assets, prompts, snapshot, speaker };
   }
   if (kind !== 'image') fail('Choose a clip for video or dialogue generation.');
@@ -181,6 +248,7 @@ export function createProduction({
   const sound = createSoundProduction({ mediaDirectory, fetcher });
   const music = createMusicProduction({ mediaDirectory, fetcher });
   const references = createReferenceStorage({ openart, store, mediaDirectory, fetcher });
+  const voices = createVoiceProduction({ mediaDirectory, fetcher });
   async function reference(mediaId, job) {
     await assertMediaAccess([mediaId]);
     const media = await StudioMedia.findById(id(mediaId)).lean();
@@ -191,7 +259,9 @@ export function createProduction({
     return references.reference(mediaId, job.kind === 'video' ? 'create-video' : 'create-image');
   }
   function videoPrompt(state, instructions) {
-    const prompt = productionVideoPrompt(state.scene, state.clip, instructions);
+    const prompt = productionVideoPrompt(state.scene, state.clip, instructions, {
+      characterReferences: state.snapshot.characterReferences ?? []
+    });
     if (prompt.length > 4500)
       fail(
         `Video prompt is ${prompt.length} characters; Wan allows 4500. Shorten the clip directions or requested changes before rendering. No directions were truncated.`
@@ -206,9 +276,11 @@ export function createProduction({
     revisionProposalId,
     kind,
     target,
+    speaker,
     instructions = '',
     referenceIds = []
   }) {
+    if (kind === 'voice') return voices.queue({ target, speaker, requestId, chatId });
     if (!['image', 'video', 'dialogue'].includes(kind)) fail('Choose image, video or dialogue.');
     text(instructions, 'Render instructions', 6000);
     if (!Array.isArray(referenceIds) || referenceIds.length > 12)
@@ -217,6 +289,13 @@ export function createProduction({
     const previous = await Job.findOne({ requestId }).lean();
     if (previous) return previous;
     const state = await renderTarget(target, kind, revisionProposalId);
+    if (kind === 'video' && state.clip.dialogue?.trim()) {
+      const issue = animaticTimingIssue(
+        state.clip,
+        await dialogueDuration(state.clip.selectedDialogueId, mediaDirectory, { refresh: true })
+      );
+      if (issue) fail(issue.message + ' Review the timing revision before generating video.', 409);
+    }
     if (kind === 'video')
       await validateRevision({ target, instructions, referenceIds, revisionProposalId }, state);
     if (kind === 'video') videoPrompt(state, instructions);
@@ -246,6 +325,13 @@ export function createProduction({
   }
   async function build(job) {
     const state = await renderTarget(job.target, job.kind, job.revisionProposalId);
+    if (job.kind === 'video' && state.clip.dialogue?.trim()) {
+      const issue = animaticTimingIssue(
+        state.clip,
+        await dialogueDuration(state.clip.selectedDialogueId, mediaDirectory, { refresh: true })
+      );
+      if (issue) fail(issue.message + ' Review the timing revision before generating video.', 409);
+    }
     if (job.kind === 'video') await validateRevision(job, state);
     if (digest(state.snapshot) !== digest(job.snapshot))
       fail(
@@ -255,45 +341,25 @@ export function createProduction({
     let refs = [...job.referenceIds];
     if (job.kind === 'video')
       refs = [
-        ...state.snapshot.imageIds,
+        ...(state.snapshot.transition?.imageIds ?? state.snapshot.imageIds),
+        ...(state.snapshot.characterReferences?.map((reference) => reference.mediaId) ?? []),
         ...(state.snapshot.dialogueId ? [state.snapshot.dialogueId] : [])
       ];
-    else
-      refs = [
-        ...new Set([
-          ...(job.target.packageItemId &&
-          job.target.packageItemId !== 'master-portrait' &&
-          ['character', 'droid'].includes(state.asset?.kind)
-            ? [
-                state.asset.production.items.find((i) => i.id === 'master-portrait')?.mediaId
-              ].filter(Boolean)
-            : []),
-          ...(state.prompts?.continuity?.mediaIds ?? []),
-          ...refs,
-          ...(job.target.packageItemId &&
-          job.target.packageItemId !== 'master-portrait' &&
-          ['character', 'droid'].includes(state.asset?.kind) &&
-          state.asset.production.items.some((i) => i.id === 'master-portrait' && i.mediaId)
-            ? []
-            : (state.asset?.identitySourceMediaIds?.map(String) ?? [])),
-          ...(state.asset?.production?.items?.find((i) => i.id === job.target.packageItemId)
-            ?.referenceMediaIds?.length
-            ? state.asset.production.items.find((i) => i.id === job.target.packageItemId)
-                .referenceMediaIds
-            : workflowEnabled()
-              ? state.asset?.production?.items?.find((i) => i.id === job.target.packageItemId)
-                  ?.sourceMediaIds?.length
-                ? state.asset.production.items.find((i) => i.id === job.target.packageItemId)
-                    .sourceMediaIds
-                : (state.asset?.production?.sourceMediaIds ?? [])
-              : []),
-          ...(state.prompts?.referenceMediaIds ??
-            state.asset.finalChoice?.mediaIds?.map(String) ??
-            [])
-        ])
-      ];
-    if (refs.length > 16)
-      fail('Too many image references; select fewer references for this request.');
+    else {
+      const selection = imageReferenceSelection({
+        asset: state.asset,
+        prompts: state.prompts,
+        packageItemId: job.target.packageItemId,
+        referenceIds: refs,
+        workflow: workflowEnabled()
+      });
+      refs = selection.selected;
+      if (selection.omitted.length)
+        await Job.updateOne(
+          { _id: job._id },
+          { $set: { 'payload.referenceSelection': selection } }
+        );
+    }
     if (
       job.kind === 'image' &&
       (await StudioMedia.exists({ _id: { $in: refs }, kind: { $ne: 'image' } }))
@@ -305,7 +371,7 @@ export function createProduction({
         : job.target.packageItemId
           ? ''
           : (state.prompts?.[job.kind] ??
-            `Star Wars universe, ${projectEra()}. Photorealistic live-action reference. ${state.asset.name}: ${state.asset.brief}. ${state.asset.notes ?? ''}`);
+            `Star Wars universe, ${projectEra()}. Photorealistic live-action reference. ${state.asset.name}: ${visualImageDirections(state.asset.brief)} ${visualImageDirections(state.asset.notes)}`);
     if (
       job.kind === 'image' &&
       ['character', 'droid', 'prop', 'wardrobe'].includes(state.asset?.kind) &&
@@ -315,7 +381,12 @@ export function createProduction({
         state.asset.kind === 'prop'
           ? '\nCreate a coherent multiview PROP SHEET: both sides, top, rear, grip and blade/emitter details with consistent scale. Consistent design across views. No labels, text or captions.'
           : '\nCreate a production BODY TURNAROUND: the same single character in complete front, three-quarter, side profile and rear full-body views, heads and feet visible in every view. One character and one outfit, consistent face, hair, proportions, clothing and materials. Neutral standing poses, hands visible, plain light-gray background and even lighting. No inset portraits, readable text, labels or scenery. Clothing must follow the reviewed source or an explicitly approved wardrobe brief; never invent an interim costume.';
-    if (job.kind !== 'video' && !job.target.packageItemId)
+    if (
+      job.kind !== 'video' &&
+      !job.target.packageItemId &&
+      !state.clip?.production?.imagePrompt &&
+      job.instructions?.trim()
+    )
       prompt += '\nREQUESTED CHANGES: ' + job.instructions;
     if (
       job.kind === 'image' &&
@@ -323,7 +394,7 @@ export function createProduction({
       workflowEnabled() &&
       state.asset?.production?.sourceNotes
     )
-      prompt += '\nREVIEWED SOURCE OBSERVATIONS: ' + state.asset.production.sourceNotes;
+      prompt += '\nVISUAL DETAILS: ' + visualImageDirections(state.asset.production.sourceNotes);
     if (job.target.packageItemId) {
       const item = state.asset.production.items.find((i) => i.id === job.target.packageItemId);
       if (
@@ -337,10 +408,36 @@ export function createProduction({
         );
       prompt = packageImagePrompt(state.asset, item, {
         era: projectEra(),
-        instructions: job.instructions
+        instructions: job.instructions,
+        assets: state.assets,
+        workflow: workflowEnabled()
       });
     }
-    const visualReferences = await Promise.all(refs.map((mid) => reference(mid, job)));
+    prompt = cleanRenderPrompt(prompt);
+    const imageItems =
+      job.kind === 'image'
+        ? imageReferenceItems(refs, { assets: state.assets, continuity: state.prompts?.continuity })
+        : [];
+    if (job.kind === 'image') prompt = withImageReferencePrompt(prompt, imageItems);
+    let visualReferences = await Promise.all(refs.map((mid) => reference(mid, job)));
+    if (job.kind === 'image')
+      visualReferences = visualReferences.map((ref, index) => ({
+        ...ref,
+        // OpenArt adds the @ prefix to attachment labels in its editor.
+        label: `image${index + 1} - ${imageItems[index].subject || imageItems[index].role}`
+      }));
+    if (job.kind === 'video') {
+      let imageIndex = 0;
+      visualReferences = visualReferences.map((ref) => ({
+        ...ref,
+        label:
+          ref.type === 'image'
+            ? `Image${++imageIndex} - ${imageIndex === 1 ? 'START reference' : state.snapshot.transition?.endImageId && imageIndex === 2 ? 'END composition' : 'IDENTITY: ' + (state.snapshot.characterReferences?.find((reference) => reference.imageNumber === imageIndex)?.names.join(' / ') ?? 'character')}`
+            : ref.type === 'audio'
+              ? 'Audio1 - approved dialogue voice reference'
+              : ref.label
+      }));
+    }
     if (job.kind === 'image')
       return {
         state,
@@ -391,7 +488,11 @@ export function createProduction({
       state,
       model: 'wan3-0',
       mode: 'image2video',
-      params: { ...params, startFrame: visualReferences[0] }
+      params: {
+        ...params,
+        startFrame: visualReferences[0],
+        ...(state.snapshot.transition?.endImageId ? { endFrame: visualReferences[1] } : {})
+      }
     };
   }
   async function download(url) {
@@ -550,11 +651,12 @@ export function createProduction({
     await SourceGrant.deleteMany({ jobId: String(job._id) });
   }
   async function dialogue(job, state) {
-    const { voice, spokenText } = state.speaker;
+    const { inputs } = state.speaker;
+    const multiple = new Set(inputs.map((input) => input.voice_id)).size > 1;
     const settings = {
-      voiceId: voice.finalChoice.voiceId,
+      voiceId: inputs[0].voice_id,
       model_id: 'eleven_v3',
-      text: spokenText,
+      text: inputs.map((input) => input.text).join('\n'),
       voice_settings: { stability: 0.5 },
       seed: 42020,
       apply_text_normalization: 'on'
@@ -563,26 +665,37 @@ export function createProduction({
       { _id: job._id },
       {
         $set: {
-          settings: { voiceId: settings.voiceId, model: settings.model_id },
+          settings: { voiceId: settings.voiceId, model: settings.model_id, inputs },
           status: 'submitting'
         }
       }
     );
     const response = await fetcher(
-      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(settings.voiceId)}?output_format=mp3_44100_192`,
+      multiple
+        ? 'https://api.elevenlabs.io/v1/text-to-dialogue?output_format=mp3_44100_192'
+        : `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(settings.voiceId)}?output_format=mp3_44100_192`,
       {
         method: 'POST',
         headers: {
           'xi-api-key': process.env.ELEVENLABS_API_KEY,
           'content-type': 'application/json'
         },
-        body: JSON.stringify({
-          model_id: settings.model_id,
-          text: settings.text,
-          voice_settings: settings.voice_settings,
-          seed: settings.seed,
-          apply_text_normalization: settings.apply_text_normalization
-        }),
+        body: JSON.stringify(
+          multiple
+            ? {
+                inputs,
+                model_id: settings.model_id,
+                seed: settings.seed,
+                apply_text_normalization: 'on'
+              }
+            : {
+                model_id: settings.model_id,
+                text: settings.text,
+                voice_settings: settings.voice_settings,
+                seed: settings.seed,
+                apply_text_normalization: settings.apply_text_normalization
+              }
+        ),
         signal: AbortSignal.timeout(120000)
       }
     );
@@ -595,11 +708,17 @@ export function createProduction({
     const media = await saveGeneratedMedia(mediaDirectory, buffer, `dialogue-${job._id}.mp3`, {
       productionJobId: String(job._id)
     });
+    await dialogueDuration(media._id, mediaDirectory, { refresh: true });
     await Job.updateOne({ _id: job._id }, { $set: { resultMediaIds: [String(media._id)] } });
     await attach(job, media);
     await Job.updateOne({ _id: job._id }, { $set: { status: 'ready' } });
   }
   async function processJob(job) {
+    if (job.kind === 'voice') {
+      if (job.status === 'importing')
+        return withProject(job.projectKey, () => voices.importPreviews(job));
+      return voices.processJob(job);
+    }
     return withProject(job.projectKey ?? legacyProjectKey, () => processJobInProject(job));
   }
   async function processJobInProject(job) {
@@ -620,7 +739,7 @@ export function createProduction({
         const { model, mode, params } = request;
         // References must be accepted into provider storage before any quote or generation.
         const references =
-          params.visualReferences ?? (params.startFrame ? [params.startFrame] : []);
+          params.visualReferences ?? [params.startFrame, params.endFrame].filter(Boolean);
         if (references.some((ref) => !/^https:\/\/cdn\.openart\.ai\//.test(ref.url)))
           fail('A reference has not been accepted into OpenArt storage; no render was submitted.');
         await openart.call('openart_model_form_get', { model, mode });
@@ -801,5 +920,5 @@ export function createProduction({
       throw error;
     }
   }
-  return { queue, processJob, build, sound, music, approveRevision };
+  return { queue, processJob, build, sound, music, voices, approveRevision };
 }

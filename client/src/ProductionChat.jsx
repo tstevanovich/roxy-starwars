@@ -24,6 +24,7 @@ import { proposalStageLabel } from '../../shared/production-proposals.js';
 import { request, uploadMedia } from './api.js';
 import ChatGPTConnection from './ChatGPTConnection.jsx';
 import { DraftSupportingNotes, ProposalContent } from './ProductionDrafts.jsx';
+import { studioUrl } from './project-url.js';
 import { reviewHref } from './review-navigation.js';
 import { ReferencePreview } from './StudioMedia.jsx';
 
@@ -303,9 +304,9 @@ function Composer({ chatId, disabled, onSent, data, onMedia }) {
         </Button>
       </Stack>
       <Typography variant="caption" color="text.secondary">
-        Attached images can be viewed by the assistant. Audio and video attachments supply file
-        details; use feedback to describe what you hear or see. Requests keep running when you close
-        this page.
+        Paste a public webpage link for the assistant to read and cite. Attached images can be
+        viewed by the assistant. Audio and video attachments supply file details; use feedback to
+        describe what you hear or see. Requests keep running when you close this page.
       </Typography>
     </Box>
   );
@@ -377,8 +378,33 @@ function Conversation({ chatId, data, onMedia, onReview, configured, onChanged }
     );
   const activeRun = detail.runs.find((r) => r._id === detail.chat.activeRun);
   const latestFailure = detail.runs[0]?.status === 'failed' ? detail.runs[0].error : '';
+  const focus = detail.chat.context;
+  const episode = data.episodes.find((item) => item._id === focus?.episodeId);
+  const scene = episode?.scenes.find((item) => item.id === focus?.sceneId);
+  const shot = scene?.clips.find((item) => item.id === focus?.clipId);
   return (
     <Stack spacing={2}>
+      {shot && (
+        <Alert
+          severity="info"
+          action={
+            <Button
+              component="a"
+              color="inherit"
+              href={
+                studioUrl(`/?episode=${encodeURIComponent(episode._id)}`) +
+                `#picture-prerequisites-${shot.id}`
+              }
+            >
+              Back to shot
+            </Button>
+          }
+        >
+          Discussing: {episode.title} / {scene.title} / {shot.title}. Changes are scoped to this
+          shot unless you ask otherwise. Chat reads the latest saved shot, prompts and selections;
+          media generation still uses the Generate buttons.
+        </Alert>
+      )}
       {error && <Alert severity="error">{error}</Alert>}
       {mutation?.error && !mutation.path.startsWith('/proposals/') && (
         <Alert severity="error">{mutation.error}</Alert>
@@ -648,7 +674,30 @@ export default function ProductionChat({
   useEffect(() => {
     let active = true;
     Promise.all([request(base + '/chats'), request(base + '/connections')])
-      .then(([list, settings]) => {
+      .then(async ([list, settings]) => {
+        const address = new URL(window.location.href);
+        const focusedContext = initialContext.clipId
+          ? initialContext
+          : {
+              episodeId: address.searchParams.get('episode'),
+              sceneId: address.searchParams.get('scene'),
+              clipId: address.searchParams.get('shot')
+            };
+        if (focusedContext.clipId && focusedContext.episodeId && focusedContext.sceneId) {
+          const { chat } = await request(base + '/chats', {
+            method: 'POST',
+            body: { context: focusedContext, reuseShot: true }
+          });
+          if (!active) return;
+          setContext(chat.context);
+          setChats([chat, ...list.chats.filter((item) => item._id !== chat._id)]);
+          setConnections(settings);
+          setSelected(chat._id);
+          address.searchParams.set('chat', chat._id);
+          for (const key of ['episode', 'scene', 'shot']) address.searchParams.delete(key);
+          window.history.replaceState({}, '', address.pathname + address.search + address.hash);
+          return;
+        }
         if (active) {
           setChats(list.chats);
           setConnections(settings);

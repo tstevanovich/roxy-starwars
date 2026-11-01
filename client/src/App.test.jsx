@@ -57,6 +57,30 @@ beforeEach(() => {
   vi.stubGlobal('scrollTo', vi.fn());
 });
 
+test('zero pending results links to automatic production status for an incomplete episode', async () => {
+  vi.mocked(request).mockResolvedValue({
+    ...data,
+    assets: [],
+    workflowReviews: [],
+    episodes: [
+      {
+        _id: 'unfinished',
+        title: 'Initial Sith Trials',
+        scenes: [],
+        workflowVersion: 1,
+        workflowReady: false
+      }
+    ]
+  });
+  mount();
+  expect(
+    await screen.findByText(/No results are ready for approval. Production is still incomplete/)
+  ).toBeVisible();
+  expect(
+    screen.getByRole('link', { name: 'Open production status for Initial Sith Trials' })
+  ).toHaveAttribute('href', '/?episode=unfinished#production-approval-board');
+});
+
 test('loads the studio and opens candidate review from the dashboard', async () => {
   const user = userEvent.setup();
   vi.mocked(request).mockResolvedValue(data);
@@ -341,7 +365,9 @@ test('prop records expose their reference sheet workflow', () => {
   );
   expect(screen.getByRole('heading', { name: 'Prop sheets' })).toBeInTheDocument();
   expect(
-    screen.getByText('Finalize the prop’s design before adding its prop sheet.')
+    screen.getByText(
+      'Choose a prop reference in Compare your options and press Finalize this option before adding its prop sheet.'
+    )
   ).toBeInTheDocument();
 });
 

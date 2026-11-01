@@ -57,7 +57,9 @@ export async function assertNoPendingRevision(target, excludedId) {
       (p.render &&
         p.render.target.sceneId === target.sceneId &&
         p.render.target.clipId === target.clipId) ||
-      (p.scene && p.scene.id === target.sceneId) ||
+      (p.scene &&
+        p.scene.id === target.sceneId &&
+        (!p.targetClipId || p.targetClipId === target.clipId)) ||
       p.production ||
       (!p.scene && !p.render)
   );

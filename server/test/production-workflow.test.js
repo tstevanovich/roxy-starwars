@@ -10,10 +10,12 @@ import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import request from 'supertest';
 
+import { animaticTimingIssue, splitDialogueForTiming } from '../../shared/animatic-timing.js';
 import { nativeAudioPolicy } from '../../shared/audio-policy.js';
 import { musicPrompt } from '../../shared/scene-music.js';
+import { soundPlanReviewInput } from '../../shared/sound-plan-review.js';
 import { createApp } from '../src/app.js';
-import { approvalRecoveryPlan } from '../src/approval-recovery.js';
+import { approvalRecoveryPlan, sceneApprovalBindings } from '../src/approval-recovery.js';
 import {
   createChatEngine,
   makeProposal,
@@ -38,13 +40,17 @@ import {
   StudioSourceEvidence
 } from '../src/models/Studio.js';
 import { omitOpeningCrawl } from '../src/omit-opening-crawl.js';
-import { requireWorkflow, workflowContext } from '../src/production-workflow.js';
+import { evaluateWorkflow, requireWorkflow, workflowContext } from '../src/production-workflow.js';
 import { withProject } from '../src/projects.js';
 import { restartVideoPass } from '../src/restart-video-pass.js';
 import { mixState, validateMixedSelection } from '../src/sound-design.js';
 import { saveGeneratedMedia } from '../src/studio-media.js';
 import { clipPrompts } from '../src/studio-prompts.js';
-import { createWorkflowAutomation } from '../src/workflow-automation.js';
+import { createWorkflowAutomation as createManualAutomation } from '../src/workflow-automation.js';
+
+// Keep the earlier automation regression cases as explicit legacy opt-in tests.
+const createWorkflowAutomation = (production, options = {}) =>
+  createManualAutomation(production, { ...options, automaticMediaGeneration: true });
 
 const key = 'workflow-test',
   headers = { 'X-Studio-Project': key },
@@ -305,6 +311,368 @@ const at = (scope, recordId, sceneId, clipId) => ({
   recordId: String(recordId),
   ...(sceneId ? { sceneId } : {}),
   ...(clipId ? { clipId } : {})
+});
+
+test('visual scene corrections keep the approved sound plan and sound text without another approval', async () => {
+  await prepare();
+  const before = await StudioEpisode.findById(episode._id).lean(),
+    original = before.scenes[0];
+  const proposal = await withProject(key, () =>
+    makeProposal(new mongoose.Types.ObjectId(), {
+      episodeId: String(episode._id),
+      title: 'Correct the conversational background',
+      explanation: 'Only change the framing.',
+      scene: {
+        ...original,
+        soundPlan: {
+          ...original.soundPlan,
+          notes: 'An unsolicited paraphrase.',
+          layers: original.soundPlan.layers.map((layer) => ({
+            ...layer,
+            description: 'An unsolicited sound rewrite.'
+          }))
+        },
+        clips: original.clips.map((clip) => ({
+          ...clip,
+          camera: 'Corrected camera framing.',
+          soundEffects: 'An unsolicited effects rewrite.'
+        }))
+      }
+    })
+  );
+  assert.deepEqual(proposal.scene.soundPlan, original.soundPlan);
+  assert.equal(proposal.scene.clips[0].soundEffects, original.clips[0].soundEffects);
+  await request(app)
+    .post(base + '/assistant/proposals/' + proposal._id + '/apply')
+    .set(headers)
+    .send({})
+    .expect(200);
+  assert.equal((await state(sceneTarget(), 'sound-plan')).status, 'approved');
+  assert.notEqual((await state(sceneTarget(), 'shot-plan')).status, 'approved');
+  const saved = await StudioEpisode.findById(episode._id).lean();
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    { $set: { 'scenes.0.soundPlan.layers.0.gainDb': -9 } }
+  );
+  assert.notEqual((await state(sceneTarget(), 'sound-plan')).status, 'approved');
+  assert.deepEqual(saved.scenes[0].soundPlan, original.soundPlan);
+});
+
+test('continuous ambience survives mechanical shot splitting but changed effects and levels require review', () => {
+  const clip = { id: 'room', duration: 20, soundEffects: 'Continuous room ventilation.' };
+  const layer = {
+    id: 'bed',
+    clipId: clip.id,
+    title: 'Room bed',
+    type: 'ambience',
+    description: 'Quiet ventilation.',
+    start: 0,
+    duration: 20,
+    gainDb: -26,
+    lowpassHz: 0,
+    loop: true,
+    assetId: null
+  };
+  const original = { soundPlan: { notes: 'No music.', layers: [layer] }, clips: [clip] };
+  const split = {
+    soundPlan: {
+      ...original.soundPlan,
+      layers: [7, 14].map((duration, index) => ({
+        ...layer,
+        id: 'bed-' + index,
+        clipId: 'room-' + index,
+        duration
+      }))
+    },
+    clips: [7, 14].map((duration, index) => ({ ...clip, id: 'room-' + index, duration }))
+  };
+  assert.deepEqual(soundPlanReviewInput(split), soundPlanReviewInput(original));
+  split.soundPlan.layers[1].gainDb = -8;
+  assert.notDeepEqual(soundPlanReviewInput(split), soundPlanReviewInput(original));
+  split.soundPlan.layers[1] = { ...split.soundPlan.layers[1], type: 'effect', start: 2 };
+  assert.notDeepEqual(soundPlanReviewInput(split), soundPlanReviewInput(original));
+});
+
+test('chat and asset creation reuse an existing character package instead of restarting its images', async () => {
+  await prepare();
+  await StudioAsset.updateOne({ _id: asset._id }, { $set: { name: 'Kory' } });
+  const before = await StudioAsset.findById(asset._id).lean();
+  const reused = await request(app)
+    .post(base + '/assets')
+    .set(headers)
+    .send({
+      name: 'Kory — acolyte character production package',
+      kind: 'character',
+      scope: 'reusable',
+      brief: 'A duplicate should not be created.'
+    })
+    .expect(200);
+  assert.equal(reused.body.reusedExisting, true);
+  assert.equal(reused.body.asset._id, String(asset._id));
+  const chat = await withProject(key, () =>
+    Chat.create({ title: 'Fix Kory shot', context: { episodeId: String(episode._id) } })
+  );
+  const run = await withProject(key, () => Run.create({ chatId: chat._id, status: 'queued' }));
+  let replies = 0;
+  const chatgpt = {
+    ready: async () => ({ profileId: 'test-profile', model: 'test-model' }),
+    respond: async ({ input }) => {
+      if (++replies === 1)
+        return {
+          output: [
+            {
+              type: 'function_call',
+              name: 'create_asset_draft',
+              call_id: 'duplicate',
+              arguments: JSON.stringify({
+                name: 'Kory — acolyte character production package',
+                kind: 'character',
+                scope: 'reusable',
+                brief: 'Kory identity.',
+                production: {}
+              })
+            }
+          ]
+        };
+      const result = JSON.parse(input.find((item) => item.type === 'function_call_output').output);
+      assert.equal(result.reusedExisting, true);
+      assert.equal(result._id, String(asset._id));
+      return {
+        output: [
+          {
+            type: 'message',
+            content: [{ type: 'output_text', text: 'Reusing the existing approved Kory package.' }]
+          }
+        ]
+      };
+    }
+  };
+  await createChatEngine({ chatgpt, production, mediaDirectory: directory }).run(run.toObject());
+  assert.equal((await Run.findById(run._id).lean()).status, 'completed');
+  assert.deepEqual(await StudioAsset.findById(asset._id).lean(), before);
+  assert.equal(await StudioAsset.countDocuments({ kind: 'character' }), 1);
+  assert.equal(await Job.countDocuments(), 0);
+  const context = await withProject(key, () => studioContext({ episodeId: String(episode._id) }));
+  assert.ok(context.characterDirectory.some((item) => item.name === 'Kory' && item.finalized));
+  await StudioAsset.updateOne({ _id: asset._id }, { $set: { archived: true } });
+  assert.deepEqual(
+    await withProject(key, () => createWorkflowAutomation(production).plan(assetTarget())),
+    []
+  );
+});
+
+test('brief drafts apply to legacy shot assets with no production field and preserve shot ownership', async () => {
+  const shot = await withProject(key, () =>
+    StudioAsset.create({
+      name: 'Roxy and Kory composition',
+      kind: 'shot',
+      episodeId: episode._id,
+      sceneId: 'scene',
+      clipId: 'shot',
+      revision: 8,
+      brief: 'Original composition.'
+    })
+  );
+  await StudioAsset.updateOne({ _id: shot._id }, { $unset: { production: 1 } });
+  const proposal = await withProject(key, () =>
+    productionProposal(new mongoose.Types.ObjectId(), {
+      scope: 'asset',
+      recordId: String(shot._id),
+      title: 'Correct conversation cast',
+      explanation: 'Use Roxy and Kory.',
+      brief: 'Roxy and Kory converse. Harkun must not appear.',
+      production: {}
+    })
+  );
+  assert.deepEqual(proposal.baseProduction, { items: [] });
+  // Existing drafts made before the fix also lack an explicit baseline.
+  await Proposal.updateOne({ _id: proposal._id }, { $unset: { baseProduction: 1 } });
+  await request(app)
+    .post(base + '/assistant/proposals/' + proposal._id + '/apply')
+    .set(headers)
+    .send({})
+    .expect(200);
+  const saved = await StudioAsset.findById(shot._id).lean();
+  assert.equal(saved.brief, 'Roxy and Kory converse. Harkun must not appear.');
+  assert.equal(saved.production.managed, false);
+  assert.equal(saved.clipId, 'shot');
+  assert.equal(saved.revision, 9);
+  assert.equal(await Job.countDocuments(), 0);
+});
+
+test('sound plan approval accepts unrelated episode updates but rejects changed sound and concurrent reviews', async () => {
+  await prepare();
+  await review(sceneTarget(), 'sound-plan', 'unapprove');
+  const shown = await state(sceneTarget(), 'sound-plan');
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    { $set: { notes: 'An unrelated production update.' }, $inc: { revision: 1 } }
+  );
+  await StudioReview.updateOne(
+    { 'target.sceneId': 'scene', stage: 'script' },
+    { $inc: { revision: 1 } }
+  );
+  const refreshed = await state(sceneTarget(), 'sound-plan');
+  assert.notEqual(refreshed.fingerprint, shown.fingerprint);
+  assert.equal(refreshed.approvalFingerprint, shown.approvalFingerprint);
+  const approved = await request(app)
+    .post(base + '/workflow/review')
+    .set(headers)
+    .send({ ...shown, action: 'approve' })
+    .expect(200);
+  assert.equal(approved.body.review.state, 'approved');
+  await request(app)
+    .post(base + '/workflow/review')
+    .set(headers)
+    .send({ ...shown, action: 'approve' })
+    .expect(409);
+  const stale = await state(sceneTarget(), 'sound-plan');
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    { $set: { 'scenes.0.soundPlan.notes': 'Changed sound directions.' }, $inc: { revision: 1 } }
+  );
+  await request(app)
+    .post(base + '/workflow/review')
+    .set(headers)
+    .send({ ...stale, action: 'approve' })
+    .expect(409);
+});
+
+test('Creative brief drafts fill the saved field, retain source approval and protect newer owner edits', async () => {
+  await StudioAsset.updateOne({ _id: asset._id }, { $set: { brief: '' } });
+  await review(assetTarget(), 'source');
+  const before = await StudioAsset.findById(asset._id).lean();
+  const proposal = await withProject(key, () =>
+    productionProposal(new mongoose.Types.ObjectId(), {
+      scope: 'asset',
+      recordId: String(asset._id),
+      title: 'Complete character brief',
+      explanation: 'Use the saved source evidence.',
+      brief: 'Adult woman. Preserve the source costume and existing voice.',
+      production: before.production
+    })
+  );
+  assert.equal(proposal.baseBrief, '');
+  assert.deepEqual(proposal.reviewStages, ['brief']);
+  await StudioAsset.updateOne(
+    { _id: asset._id },
+    { $set: { notes: 'New owner note' }, $inc: { revision: 1 } }
+  );
+  await request(app)
+    .post(base + '/assistant/proposals/' + proposal._id + '/apply')
+    .set(headers)
+    .send({})
+    .expect(200);
+  const saved = await StudioAsset.findById(asset._id).lean();
+  assert.equal(saved.brief, proposal.brief);
+  assert.equal(saved.notes, 'New owner note');
+  assert.deepEqual(saved.production, before.production);
+  assert.equal((await state(assetTarget(), 'source')).status, 'approved');
+  assert.equal((await state(assetTarget(), 'brief')).status, 'pending-review');
+  assert.equal(await Job.countDocuments(), 0);
+  const revision = await withProject(key, () =>
+    productionProposal(new mongoose.Types.ObjectId(), {
+      scope: 'asset',
+      recordId: String(asset._id),
+      title: 'Brief correction',
+      explanation: 'Correction for review',
+      brief: 'Revised draft',
+      production: saved.production
+    })
+  );
+  await StudioAsset.updateOne(
+    { _id: asset._id },
+    { $set: { brief: 'Newer owner-written brief' }, $inc: { revision: 1 } }
+  );
+  const conflict = await request(app)
+    .post(base + '/assistant/proposals/' + revision._id + '/apply')
+    .set(headers)
+    .send({})
+    .expect(409);
+  assert.match(conflict.body.message, /Creative brief has newer edits/);
+});
+
+test('creating an empty character queues one restricted Creative brief draft without media generation', async () => {
+  const ready = { ready: async () => ({ profileId: 'test-profile', model: 'test-model' }) };
+  const automation = createWorkflowAutomation(production, { queueStory: createStoryQueue(ready) });
+  app.locals.assistant.automation = automation;
+  const created = await request(app)
+    .post(base + '/assets')
+    .set(headers)
+    .send({
+      name: 'New acolyte',
+      kind: 'character',
+      brief: '',
+      production: { sourceMode: 'original', sourceNotes: 'Adult woman, red hair, ochre tunic.' }
+    })
+    .expect(201);
+  const target = at('asset', created.body.asset._id);
+  assert.equal(await StudioAutomation.countDocuments({ status: 'queued' }), 1);
+  // Simulate a missed creation event and verify periodic recovery is idempotent.
+  await StudioAutomation.deleteMany({});
+  await automation.reconcileProduction();
+  await automation.reconcileProduction();
+  assert.equal(await StudioAutomation.countDocuments({ status: 'queued' }), 1);
+  await automation.processNext();
+  const run = await Run.findOne().lean();
+  assert.equal(run.workflowDraft.kind, 'story-asset-brief');
+  assert.equal((await Chat.findById(run.chatId).lean()).context.assetId, target.recordId);
+  let replies = 0;
+  const chatgpt = {
+    ...ready,
+    respond: async ({ tools }) => {
+      assert.ok(tools.some((t) => t.name === 'propose_production_plan'));
+      assert.ok(!tools.some((t) => ['create_asset_draft', 'request_render'].includes(t.name)));
+      if (++replies === 1)
+        return {
+          output: [
+            {
+              type: 'function_call',
+              name: 'propose_production_plan',
+              call_id: 'brief',
+              arguments: JSON.stringify({
+                scope: 'asset',
+                recordId: target.recordId,
+                title: 'Acolyte Creative brief',
+                explanation: 'Source-grounded brief',
+                brief:
+                  'Adult woman with red hair and an ochre tunic. Rear costume remains unverified.',
+                production: { sourceNotes: 'Must not overwrite saved research.', items: [] }
+              })
+            }
+          ]
+        };
+      return {
+        output: [
+          {
+            type: 'message',
+            content: [{ type: 'output_text', text: 'Creative brief draft ready for review.' }]
+          }
+        ]
+      };
+    }
+  };
+  await createChatEngine({ chatgpt, production, mediaDirectory: directory }).run(run);
+  assert.equal((await Run.findById(run._id).lean()).status, 'completed');
+  const proposal = await Proposal.findOne({ assetId: target.recordId }).lean();
+  assert.match(proposal.brief, /Adult woman/);
+  assert.equal(proposal.production.sourceNotes, 'Adult woman, red hair, ochre tunic.');
+  assert.equal(proposal.production.items.length, created.body.asset.production.items.length);
+  assert.equal((await StudioAsset.findById(target.recordId).lean()).brief, '');
+  const progress = await withProject(key, () => automation.progress(target));
+  assert.equal(progress.proposalId, String(proposal._id));
+  const overview = await request(app).get(base).set(headers).expect(200);
+  assert.ok(
+    overview.body.workflowReviews.some(
+      (row) =>
+        row.key === 'proposal-' + proposal._id &&
+        row.target.scope === 'asset' &&
+        row.target.recordId === target.recordId
+    )
+  );
+  assert.equal((await withProject(key, () => automation.plan(target))).length, 0);
+  assert.equal(await Job.countDocuments(), 0);
+  assert.equal(await StudioAsset.countDocuments({ name: 'New acolyte' }), 1);
 });
 
 test('applying an image instruction revision requires its own approval before one replacement queues', async () => {
@@ -593,6 +961,44 @@ test('music approval queues one instrumental audition, trims silence locally and
       .send({ ...musicReview, action: 'approve', musicMediaId: option.mediaIds[0] })
       .expect(200);
     assert.equal((await state(sceneTarget(), 'music')).status, 'approved');
+    await StudioEpisode.updateOne(
+      { _id: episode._id },
+      {
+        $set: { 'production.outline': 'An unrelated episode outline update.' },
+        $inc: { revision: 1 }
+      }
+    );
+    assert.equal((await state(sceneTarget(), 'music-plan')).status, 'approved');
+    assert.equal((await state(sceneTarget(), 'music')).status, 'approved');
+    await StudioEpisode.updateOne(
+      { _id: episode._id },
+      { $set: { production: original.production } }
+    );
+    const recoveryData = {
+      assets: await StudioAsset.find().lean(),
+      episodes: await StudioEpisode.find().lean(),
+      media: await StudioMedia.find().lean(),
+      musicCues: await StudioMusicCue.find().lean(),
+      reviews: (await StudioReview.find().lean()).map((row) =>
+        row.stage.startsWith('music')
+          ? { ...row, approvalFingerprint: null, fingerprint: 'legacy-workflow-fingerprint' }
+          : row
+      )
+    };
+    assert.equal(
+      sceneApprovalBindings(recoveryData).bindings.filter((row) => row.stage.startsWith('music'))
+        .length,
+      2
+    );
+    const changedMusic = {
+      ...recoveryData,
+      musicCues: recoveryData.musicCues.map((cue) => ({ ...cue, prompt: 'A changed music brief.' }))
+    };
+    assert.equal(
+      sceneApprovalBindings(changedMusic).bindings.filter((row) => row.stage.startsWith('music'))
+        .length,
+      0
+    );
     assert.equal((await state(clipTarget(), 'visual')).status, 'approved');
     assert.deepEqual((await StudioEpisode.findById(episode._id).lean()).scenes, original.scenes);
     await withProject(key, async () => {
@@ -712,6 +1118,281 @@ async function prepare() {
   for (const stage of ['script', 'shot-plan', 'storyboard', 'animatic', 'sound-plan'])
     assert.equal((await review(sceneTarget(), stage)).status, 200);
 }
+test('manual generation is the default: approvals and recovery never create media jobs', async () => {
+  const manual = createManualAutomation(production);
+  app.locals.assistant.automation = manual;
+  await StudioEpisode.updateOne({ _id: episode._id }, { $set: { 'scenes.0.clips.0.takeIds': [] } });
+  await prepare();
+  for (const target of [assetTarget(), episodeTarget(), sceneTarget(), clipTarget()]) {
+    const steps = await withProject(key, () => manual.plan(target));
+    assert.ok(steps.every((step) => step.kind.startsWith('story-')));
+  }
+  await manual.reconcileProduction();
+  while (await StudioAutomation.exists({ status: 'queued' })) await manual.processNext();
+  assert.equal(await Job.countDocuments(), 0);
+  assert.deepEqual(calls, []);
+});
+test('dialogue generation starts only from its explicit button with the exact saved text', async () => {
+  const oldKey = process.env.ELEVENLABS_API_KEY;
+  process.env.ELEVENLABS_API_KEY = 'test-only';
+  try {
+    const voice = await withProject(key, () =>
+      StudioAsset.create({
+        name: 'Harkun voice',
+        aliases: ['HARKUN'],
+        kind: 'voice',
+        scope: 'reusable',
+        finalChoice: {
+          id: 'voice',
+          voiceId: 'approved-voice',
+          voiceModel: 'eleven_v3',
+          mediaIds: [audio._id]
+        }
+      })
+    );
+    await StudioEpisode.updateOne(
+      { _id: episode._id },
+      {
+        $push: { 'scenes.0.assetIds': voice._id },
+        $set: {
+          'scenes.0.clips.0.dialogue': 'HARKUN: Hello.',
+          'scenes.0.clips.0.production.mode': 'voice-reference',
+          'scenes.0.clips.0.selectedDialogueId': String(audio._id)
+        }
+      }
+    );
+    app.locals.assistant.automation = createManualAutomation(production);
+    await prepare();
+    await StudioEpisode.updateOne(
+      { _id: episode._id },
+      {
+        $set: {
+          'scenes.0.clips.0.selectedDialogueId': null,
+          'scenes.0.clips.0.dialogueTakeIds': []
+        }
+      }
+    );
+    const parent = await StudioEpisode.findById(episode._id).lean();
+    const body = {
+      target: clipTarget(),
+      parentRevision: parent.revision,
+      dialogue: 'HARKUN: Hello.',
+      requestId: 'manual-dialogue-button'
+    };
+    assert.equal(await Job.countDocuments(), 0);
+    await request(app)
+      .post(base + '/workflow/shot/dialogue/generate')
+      .set(headers)
+      .send({ ...body, dialogue: 'Unsaved words' })
+      .expect(409);
+    await request(app)
+      .post(base + '/workflow/shot/dialogue/generate')
+      .set(headers)
+      .send(body)
+      .expect(202);
+    await request(app)
+      .post(base + '/workflow/shot/dialogue/generate')
+      .set(headers)
+      .send(body)
+      .expect(202);
+    assert.equal(await Job.countDocuments({ kind: 'dialogue' }), 1);
+    assert.equal(await Job.countDocuments({ kind: { $in: ['image', 'video', 'music'] } }), 0);
+    assert.deepEqual(calls, []);
+  } finally {
+    if (oldKey === undefined) delete process.env.ELEVENLABS_API_KEY;
+    else process.env.ELEVENLABS_API_KEY = oldKey;
+  }
+});
+test('obsolete video hold data cannot block approved video requests or reopen reviews', async () => {
+  await StudioEpisode.updateOne({ _id: episode._id }, { $set: { 'scenes.0.clips.0.takeIds': [] } });
+  await prepare();
+  const target = { episodeId: String(episode._id), sceneId: 'scene', clipId: 'shot' };
+  const job = await withProject(key, () =>
+    production.queue({ kind: 'video', target, requestId: 'before-hold' })
+  );
+  const before = await state(clipTarget(), 'animatic');
+  await StudioEpisode.collection.updateOne(
+    { _id: episode._id },
+    {
+      $set: {
+        videoGenerationHold: {
+          active: true,
+          reason: 'Video generation is on hold during correction.'
+        }
+      }
+    }
+  );
+  const next = await withProject(key, () =>
+    production.queue({ kind: 'video', target, requestId: 'obsolete-hold-ignored' })
+  );
+  assert.equal(next.status, 'queued');
+  assert.doesNotMatch(
+    (await withProject(key, () => app.locals.assistant.automation.progress(episodeTarget())))
+      .message,
+    /on hold/
+  );
+  await production.processJob(job);
+  assert.equal((await Job.findById(job._id).lean()).status, 'rendering');
+  assert.equal((await state(clipTarget(), 'animatic')).fingerprint, before.fingerprint);
+});
+
+test('outline-only changes retain unchanged scene approvals while new production waits for the updated outline', async () => {
+  await prepare();
+  await review(clipTarget(), 'animatic', 'request-changes', 'Split or retime this shot.');
+  const stages = ['script', 'shot-plan', 'sound-plan', 'storyboard', 'animatic'];
+  const before = Object.fromEntries(
+    await Promise.all(stages.map(async (stage) => [stage, await state(sceneTarget(), stage)]))
+  );
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    { $set: { 'production.outline': 'The character arrives; later trials remain to be planned.' } }
+  );
+  assert.equal((await state(episodeTarget(), 'outline')).status, 'needs-review');
+  assert.equal((await state(clipTarget(), 'animatic')).status, 'needs-changes');
+  assert.equal((await state(clipTarget(), 'animatic')).feedbackIsCurrent, true);
+  for (const stage of stages) {
+    const row = await state(sceneTarget(), stage);
+    assert.equal(row.status, 'approved', stage);
+    assert.equal(row.approvalFingerprint, before[stage].approvalFingerprint, stage);
+  }
+  await withProject(key, async () => {
+    assert.deepEqual(await app.locals.assistant.automation.plan(sceneTarget()), []);
+    await assert.rejects(
+      () =>
+        production.queue({
+          kind: 'image',
+          requestId: 'outline-pause',
+          target: { episodeId: String(episode._id), sceneId: 'scene', clipId: 'shot' }
+        }),
+      /outline needs approval/i
+    );
+  });
+  assert.equal((await review(episodeTarget(), 'outline')).status, 200);
+  for (const stage of stages)
+    assert.equal((await state(sceneTarget(), stage)).status, 'approved', stage);
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    { $set: { 'scenes.0.script': 'A changed story event at the door.' } }
+  );
+  assert.equal((await state(sceneTarget(), 'script')).status, 'needs-review');
+  assert.equal((await state(sceneTarget(), 'shot-plan')).status, 'needs-review');
+  assert.deepEqual(calls, []);
+});
+
+test('scene source bindings ignore unrelated chapters but reopen the affected scene when its source changes', async () => {
+  const source = {
+    id: 'chapter',
+    title: 'Arrival footage',
+    url: 'https://youtu.be/abcdefghijk',
+    chapter: 'Arrival',
+    startSeconds: 10,
+    endSeconds: 20,
+    notes: 'Recorded arrival.',
+    status: 'verified'
+  };
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    { $set: { sourceReferences: [source], 'scenes.0.sourceReferenceIds': ['chapter'] } }
+  );
+  await prepare();
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    {
+      $push: {
+        sourceReferences: {
+          ...source,
+          id: 'later',
+          chapter: 'Later chapter',
+          startSeconds: 30,
+          endSeconds: 40
+        }
+      }
+    }
+  );
+  assert.equal((await state(sceneTarget(), 'script')).status, 'approved');
+  assert.equal((await state(sceneTarget(), 'shot-plan')).status, 'approved');
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    { $set: { 'sourceReferences.0.notes': 'The recorded arrival evidence was corrected.' } }
+  );
+  assert.equal((await state(sceneTarget(), 'script')).status, 'needs-review');
+  assert.equal((await state(sceneTarget(), 'shot-plan')).status, 'needs-review');
+});
+
+test('historical scene approval bindings require the exact owner-approved fingerprint', async () => {
+  await prepare();
+  await StudioReview.updateMany(
+    { 'target.scope': 'scene' },
+    { $unset: { approvalFingerprint: '' } }
+  );
+  const snapshot = await StudioEpisode.findById(episode._id).lean();
+  delete snapshot.history;
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    {
+      $set: { 'production.outline': 'An outline-only edit.' },
+      $push: { history: { ...snapshot, savedAt: new Date() } }
+    }
+  );
+  await withProject(key, async () => {
+    const [assets, episodes, media, reviews] = await Promise.all([
+      StudioAsset.find().lean(),
+      StudioEpisode.find().lean(),
+      StudioMedia.find().lean(),
+      StudioReview.find().lean()
+    ]);
+    const data = { assets, episodes, media, reviews };
+    const plan = sceneApprovalBindings(data);
+    assert.equal(plan.bindings.length, 5);
+    assert.equal(plan.skipped.length, 0);
+    const bound = evaluateWorkflow({
+      ...data,
+      reviews: reviews.map((r) => ({
+        ...r,
+        approvalFingerprint:
+          plan.bindings.find((b) => b.id === String(r._id))?.approvalFingerprint ??
+          r.approvalFingerprint
+      }))
+    });
+    for (const stage of ['script', 'shot-plan', 'sound-plan', 'storyboard', 'animatic'])
+      assert.equal(bound.evaluate(sceneTarget(), stage).status, 'approved', stage);
+    const script = reviews.find((r) => r.stage === 'script');
+    script.fingerprint = 'not-the-approved-historical-inputs';
+    assert.ok(sceneApprovalBindings(data).skipped.some((row) => row.id === String(script._id)));
+    script.state = 'changes-requested';
+    assert.ok(!sceneApprovalBindings(data).bindings.some((row) => row.id === String(script._id)));
+  });
+});
+
+test('clip-scoped chat cannot store a timing revision as an episode outline', async () => {
+  await withProject(key, async () => {
+    const chat = await Chat.create({
+      title: 'Requested timing changes',
+      context: { episodeId: String(episode._id), sceneId: 'scene', clipId: 'shot' }
+    });
+    await assert.rejects(
+      () =>
+        productionProposal(chat._id, {
+          scope: 'episode',
+          recordId: String(episode._id),
+          title: 'Timing-only revision plan',
+          explanation: 'Preserve the outline; retime this shot.',
+          production: { outline: 'TARGETED TIMING PLAN — split this clip.' }
+        }),
+      /conversation targets one clip/
+    );
+    assert.equal(await Proposal.countDocuments(), 0);
+    const context = await studioContext(chat.context);
+    assert.equal(context.selectedScene.id, 'scene');
+    assert.equal(context.selectedClip.id, 'shot');
+    const serialized = JSON.stringify(context);
+    assert.ok(serialized.indexOf('selectedClip') < serialized.indexOf('sourceEvidence'));
+    assert.equal(
+      (await StudioEpisode.findById(episode._id).lean()).production.outline,
+      episode.production.outline
+    );
+  });
+});
 
 test('gates block production before provider calls, and CAS rejects stale or foreign reviews', async () => {
   await withProject(key, async () => {
@@ -844,8 +1525,14 @@ test('dialogue planning requires voice-reference mode and the animatic rejects a
   for (const stage of ['script', 'shot-plan', 'storyboard'])
     assert.equal((await review(sceneTarget(), stage)).status, 200);
   const tooLong = await review(sceneTarget(), 'animatic');
-  assert.equal(tooLong.status, 400);
+  assert.equal(tooLong.status, 200);
+  assert.equal(tooLong.body.approved, false);
+  assert.ok(tooLong.body.timingRepair);
   assert.match(tooLong.body.message, /exceeds its shot duration/);
+  const timingDraft = await Proposal.findById(tooLong.body.timingRepair).lean();
+  assert.equal(timingDraft.scene.clips[0].duration, 2);
+  assert.equal((await StudioEpisode.findById(episode._id).lean()).scenes[0].clips[0].duration, 1);
+  await Proposal.updateOne({ _id: timingDraft._id }, { $set: { status: 'dismissed' } });
   await withProject(key, () =>
     StudioEpisode.updateOne(
       { _id: episode._id },
@@ -854,6 +1541,190 @@ test('dialogue planning requires voice-reference mode and the animatic rejects a
   );
   for (const stage of ['shot-plan', 'storyboard', 'animatic'])
     assert.equal((await review(sceneTarget(), stage)).status, 200);
+});
+
+test('18-second selected dialogue automatically creates a repeatable split draft and applying it preserves unrelated work', async () => {
+  await promisify(execFile)(
+    'ffmpeg',
+    [
+      '-y',
+      '-v',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=200:duration=18.88',
+      join(directory, 'long-dialogue.wav')
+    ],
+    { windowsHide: true }
+  );
+  const long = await withProject(key, async () =>
+    saveGeneratedMedia(
+      directory,
+      await readFile(join(directory, 'long-dialogue.wav')),
+      'long-dialogue.wav'
+    )
+  );
+  const dialogue =
+    "HARKUN: Lord Zash has tasked me with sorting through you refuse to find one worthy of being her apprentice, and I intend to do just that.\nROXY: Don't get all sentimental on us. We've only just met.\nHARKUN: I won't.\nHARKUN: Now, the rest of you gutter trash already know your trial. Get going while I bring our latecomer up to speed.";
+  const original = await StudioEpisode.findById(episode._id).lean();
+  const clip = {
+    ...original.scenes[0].clips[0],
+    duration: 24,
+    dialogue,
+    dialogueTakeIds: [long._id],
+    selectedDialogueId: long._id,
+    takeIds: [],
+    selectedTakeId: null,
+    production: {
+      ...original.scenes[0].clips[0].production,
+      mode: 'voice-reference',
+      visualTakeId: null
+    }
+  };
+  const tail = { ...original.scenes[0].clips[0], id: 'unrelated-shot', title: 'Untouched shot' };
+  const soundPlan = {
+    ...original.scenes[0].soundPlan,
+    layers: [clip, tail].map((shot, index) => ({
+      ...original.scenes[0].soundPlan.layers[0],
+      id: 'room-bed-' + index,
+      clipId: shot.id,
+      start: 0,
+      sourceStart: 0,
+      assetId: null,
+      loop: true,
+      type: 'ambience',
+      duration: shot.duration
+    }))
+  };
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    {
+      $set: { 'scenes.0.clips': [clip, tail], 'scenes.0.soundPlan': soundPlan },
+      $inc: { revision: 1 }
+    }
+  );
+  const before = await StudioEpisode.findById(episode._id).lean();
+  const board = await request(app)
+    .post(base + '/workflow/board')
+    .set(headers)
+    .send({ target: episodeTarget() })
+    .expect(200);
+  const row = board.body.groups
+    .flatMap((group) => group.stages)
+    .find(
+      (row) =>
+        row.stage === 'animatic' && row.target.scope === 'clip' && row.target.clipId === clip.id
+    );
+  assert.equal(row.canApprove, false);
+  assert.equal(row.timingIssues[0].audioSeconds, 18.88);
+  const automation = createWorkflowAutomation(production, { mediaDirectory: directory });
+  await automation.reconcileProduction();
+  await automation.reconcileProduction();
+  const proposal = await Proposal.findOne({
+    episodeId: String(episode._id),
+    status: 'pending'
+  }).lean();
+  assert.ok(proposal.timingRepair);
+  assert.equal(await Proposal.countDocuments({ status: 'pending' }), 1);
+  const parts = proposal.scene.clips.filter((part) => part.id !== tail.id);
+  assert.deepEqual(soundPlanReviewInput(proposal.scene), soundPlanReviewInput(before.scenes[0]));
+  assert.ok(parts.length > 1);
+  assert.ok(
+    parts.every(
+      (part) => part.duration <= 30 && !part.selectedDialogueId && part.dialogueTakeIds.length === 0
+    )
+  );
+  const spoken = (text) =>
+    text
+      .replace(/^[A-Z]+:\s*/gm, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  assert.equal(spoken(parts.map((part) => part.dialogue).join('\n')), spoken(dialogue));
+  assert.deepEqual(proposal.scene.clips.at(-1), before.scenes[0].clips.at(-1));
+  assert.equal(proposal.scene.script, before.scenes[0].script);
+  await request(app)
+    .post(base + '/assistant/proposals/' + proposal._id + '/apply')
+    .set(headers)
+    .send({})
+    .expect(200);
+  const saved = await StudioEpisode.findById(episode._id).lean();
+  assert.deepEqual(saved.production, before.production);
+  assert.deepEqual(saved.sourceReferences, before.sourceReferences);
+  assert.deepEqual(saved.scenes[0].clips.at(-1), before.scenes[0].clips.at(-1));
+  assert.ok(
+    saved.scenes[0].clips
+      .slice(0, -1)
+      .every((part) => !part.selectedDialogueId && part.dialogueTakeIds.length === 0)
+  );
+  assert.equal(await StudioMedia.countDocuments({ _id: long._id }), 1);
+  assert.equal(await Job.countDocuments(), 0);
+});
+
+test('timing splits preserve speaker order and all words, including a single long sentence', () => {
+  const text =
+    'AL: ' + Array.from({ length: 90 }, (_, i) => 'word' + i).join(' ') + '.\nROXY: Absolutely.';
+  const parts = splitDialogueForTiming(text, 40, 40);
+  assert.ok(parts.every((part) => part.duration <= 30));
+  const spoken = (value) =>
+    value
+      .replace(/^[A-Z]+:\s*/gm, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  assert.equal(spoken(parts.map((part) => part.dialogue).join('\n')), spoken(text));
+  assert.ok(parts[0].dialogue.startsWith('AL: '));
+  assert.ok(parts.at(-1).dialogue.includes('ROXY: Absolutely.'));
+  assert.equal(animaticTimingIssue({ dialogue: 'ROXY: Hello.', duration: 15 }, 15), null);
+  assert.equal(animaticTimingIssue({ dialogue: 'HARKUN: Begin.', duration: 16 }, 14.72), null);
+  assert.equal(animaticTimingIssue({ dialogue: 'HARKUN: Begin.', duration: 24 }, 14.72), null);
+  assert.ok(animaticTimingIssue({ dialogue: 'HARKUN: Begin.', duration: 14 }, 14.72));
+  assert.ok(animaticTimingIssue({ dialogue: 'ROXY: Hello.', duration: 15 }, 15.001));
+});
+
+test('video queuing remeasures dialogue and rejects an oversized file behind an earlier animatic approval', async () => {
+  await prepare();
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    {
+      $set: {
+        'scenes.0.clips.0.dialogue': 'ROXY: Hello.',
+        'scenes.0.clips.0.duration': 3,
+        'scenes.0.clips.0.selectedDialogueId': audio._id,
+        'scenes.0.clips.0.production.mode': 'voice-reference'
+      }
+    }
+  );
+  for (const stage of ['script', 'shot-plan', 'storyboard', 'animatic', 'sound-plan'])
+    assert.equal((await review(sceneTarget(), stage)).status, 200);
+  const file = await StudioMedia.findById(audio._id).lean();
+  await promisify(execFile)(
+    'ffmpeg',
+    [
+      '-y',
+      '-v',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=200:duration=18.88',
+      join(directory, file.filename)
+    ],
+    { windowsHide: true }
+  );
+  assert.equal((await StudioMedia.findById(audio._id).lean()).durationSeconds, 2);
+  await assert.rejects(
+    () =>
+      withProject(key, () =>
+        production.queue({
+          kind: 'video',
+          requestId: 'must-remeasure-dialogue',
+          target: { episodeId: String(episode._id), sceneId: 'scene', clipId: 'shot' }
+        })
+      ),
+    /audio asset must be at most 15 seconds/
+  );
+  assert.equal(await Job.countDocuments(), 0);
+  assert.deepEqual(calls, []);
 });
 
 test('saving an exact image prompt preserves prior source decisions and requires prompt review', async () => {
@@ -946,7 +1817,9 @@ test('package renders send the exact reviewed prompt and place the approved mast
     })
   );
   const built = await withProject(key, () => production.build(job));
-  assert.equal(built.params.prompt, exact);
+  assert.ok(built.params.prompt.startsWith(exact));
+  assert.match(built.params.prompt, /@image1: Test character.*Master portrait/);
+  assert.match(built.params.prompt, /@image2: Test character.*Costume reference/);
   assert.deepEqual(
     built.params.visualReferences.map((r) => r.id),
     ['fake-image', 'costume-reference']
@@ -968,7 +1841,7 @@ test('queued jobs recheck approvals, package renders produce one unapproved item
     })
   );
   const built = await withProject(key, () => production.build(job));
-  assert.match(built.params.prompt, /ONLY the requested package deliverable/);
+  assert.match(built.params.prompt, /Create Individual profile/);
   assert.equal(built.params.imageCount, 1);
   await review(assetTarget(), 'brief', 'unapprove');
   await production.processJob(job);
@@ -1136,7 +2009,7 @@ test('image jobs use reviewed source frames and do not pass linked voice audio t
   );
   const built = await withProject(key, () => production.build(job));
   assert.ok(built.params.visualReferences.some((r) => r.id === 'fake-source'));
-  assert.match(built.params.prompt, /REVIEWED SOURCE OBSERVATIONS/);
+  assert.match(built.params.prompt, /VISUAL DETAILS: Original design direction for this test/);
   const voice = {
     _id: new mongoose.Types.ObjectId(),
     kind: 'voice',
@@ -1311,6 +2184,420 @@ test('next-step connection failures preserve the approval and can be retried wit
   assert.equal(retry.status, 200);
   await automation.processNext();
   assert.equal(attempts, 2);
+});
+
+test('one queue failure records its target and does not prevent other approved requests', async () => {
+  await StudioAsset.updateOne(
+    { _id: asset._id },
+    {
+      $set: {
+        kind: 'prop',
+        'production.items': [
+          { id: 'profile', type: 'image', title: 'Profile', notes: 'One profile.', mediaId: null },
+          { id: 'front', type: 'image', title: 'Front', notes: 'One front view.', mediaId: null }
+        ]
+      }
+    }
+  );
+  const attempted = [];
+  const automation = createWorkflowAutomation({
+    queue: async (item) => {
+      attempted.push(item.target.packageItemId);
+      if (item.target.packageItemId === 'profile')
+        throw Object.assign(new Error('Too many image references.'), { status: 400 });
+      return production.queue(item);
+    }
+  });
+  app.locals.assistant.automation = automation;
+  await review(assetTarget(), 'source');
+  await review(assetTarget(), 'brief');
+  await automation.processNext();
+  assert.deepEqual(attempted, ['profile', 'front']);
+  const action = await StudioAutomation.findOne().lean();
+  assert.equal(action.status, 'failed');
+  assert.equal(action.failures.length, 1);
+  assert.equal(action.failures[0].target.packageItemId, 'profile');
+  assert.equal(action.failures[0].error, 'Too many image references.');
+  assert.equal(await Job.countDocuments({ 'target.packageItemId': 'front' }), 1);
+  assert.equal((await state(assetTarget(), 'brief')).status, 'approved');
+  assert.deepEqual(calls, []);
+});
+
+test('missing dialogue voices automatically queue auditions before the multi-speaker performance', async () => {
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    {
+      $set: {
+        'scenes.0.clips.0.dialogue': 'ROXY: Hello.\nHARKUN: Leave.',
+        'scenes.0.clips.0.production.mode': 'voice-reference'
+      }
+    }
+  );
+  for (const stage of ['source', 'brief', 'reference:profile'])
+    assert.equal((await review(assetTarget(), stage)).status, 200);
+  for (const stage of ['source', 'outline'])
+    assert.equal((await review(episodeTarget(), stage)).status, 200);
+  for (const stage of ['script', 'shot-plan'])
+    assert.equal((await review(sceneTarget(), stage)).status, 200);
+  const response = await request(app)
+    .post(base + '/workflow/board')
+    .set(headers)
+    .send({ target: episodeTarget() })
+    .expect(200);
+  assert.equal(
+    response.body.nextSteps.some((s) => s.kind === 'dialogue'),
+    false
+  );
+  assert.equal(response.body.blockedSteps.length, 1);
+  assert.equal(response.body.blockedSteps[0].target.clipId, 'shot');
+  assert.match(
+    response.body.blockedSteps[0].error,
+    /Voice auditions need approval for: ROXY, HARKUN/
+  );
+  assert.deepEqual(
+    response.body.nextSteps.filter((step) => step.kind === 'voice').map((step) => step.speaker),
+    ['ROXY', 'HARKUN']
+  );
+  assert.deepEqual(calls, []);
+});
+
+test('automatic voice auditions wait for owner selection then generate a multi-speaker performance', async (t) => {
+  await promisify(execFile)(
+    'ffmpeg',
+    [
+      '-y',
+      '-v',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=150:duration=1',
+      join(directory, 'multi-speaker.mp3')
+    ],
+    { windowsHide: true }
+  );
+  const originalKey = process.env.ELEVENLABS_API_KEY;
+  process.env.ELEVENLABS_API_KEY = 'test-key';
+  t.after(() => {
+    if (originalKey === undefined) delete process.env.ELEVENLABS_API_KEY;
+    else process.env.ELEVENLABS_API_KEY = originalKey;
+  });
+  const requests = [],
+    mp3 = await readFile(join(directory, 'multi-speaker.mp3'));
+  let preview = 0;
+  const automated = createProduction({
+    store: createSecretStore(join(directory, 'private')),
+    mediaDirectory: directory,
+    openart: {
+      call: async () => {
+        throw new Error('Unexpected OpenArt call');
+      }
+    },
+    fetcher: async (url, options) => {
+      const body = JSON.parse(options.body);
+      requests.push({ url, body });
+      if (url.includes('/text-to-voice/design'))
+        return Response.json({
+          previews: [
+            { generated_voice_id: `preview-${++preview}`, audio_base_64: mp3.toString('base64') }
+          ],
+          text: 'Audition sample.'
+        });
+      if (url.endsWith('/text-to-voice'))
+        return Response.json({ voice_id: `saved-${body.generated_voice_id}` });
+      if (url.includes('/text-to-dialogue')) return new Response(mp3);
+      throw new Error('Unexpected ElevenLabs request');
+    }
+  });
+  const automation = createWorkflowAutomation(automated);
+  app.locals.assistant.production = automated;
+  app.locals.assistant.automation = automation;
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    {
+      $set: {
+        'scenes.0.clips.0.dialogue': 'ROXY: Hello.\nHARKUN: Leave.\nROXY: Gladly.',
+        'scenes.0.clips.0.production.mode': 'voice-reference'
+      }
+    }
+  );
+  for (const stage of ['source', 'brief', 'reference:profile']) await review(assetTarget(), stage);
+  for (const stage of ['source', 'outline']) await review(episodeTarget(), stage);
+  for (const stage of ['script', 'shot-plan'])
+    assert.equal((await review(sceneTarget(), stage)).status, 200);
+  await automation.reconcileProduction();
+  await automation.processNext();
+  await automation.processNext();
+  const voiceJobs = await Job.find({ kind: 'voice' }).sort({ createdAt: 1 }).lean();
+  assert.equal(voiceJobs.length, 2);
+  for (const job of voiceJobs) await automated.processJob(job);
+  assert.equal(requests.filter((request) => request.url.includes('/design')).length, 2);
+  assert.equal(await Job.countDocuments({ kind: 'dialogue' }), 0);
+  const voices = await StudioAsset.find({ kind: 'voice' }).lean();
+  assert.equal(voices.length, 2);
+  assert.ok(
+    voices.every(
+      (voice) =>
+        !voice.finalChoice &&
+        voice.reviewStatus === 'pending-choice' &&
+        voice.candidates.length === 1
+    )
+  );
+  await automation.reconcileProduction();
+  await automation.processNext();
+  assert.equal(await Job.countDocuments({ kind: 'voice' }), 2);
+  for (const voice of voices)
+    await request(app)
+      .post(base + '/assets/' + voice._id + '/finalize')
+      .set(headers)
+      .send({ revision: voice.revision, candidateId: voice.candidates[0].id })
+      .expect(200);
+  await automation.processNext();
+  const dialogue = await Job.findOne({ kind: 'dialogue' }).lean();
+  assert.ok(dialogue);
+  await automated.processJob(dialogue);
+  const call = requests.find((request) => request.url.includes('/text-to-dialogue'));
+  assert.ok(call);
+  assert.deepEqual(
+    call.body.inputs.map((input) => input.text),
+    ['Hello.', 'Leave.', 'Gladly.']
+  );
+  assert.equal(call.body.inputs[0].voice_id, call.body.inputs[2].voice_id);
+  assert.notEqual(call.body.inputs[0].voice_id, call.body.inputs[1].voice_id);
+  assert.equal((await Job.findById(dialogue._id).lean()).status, 'ready');
+  assert.equal(
+    (await StudioEpisode.findById(episode._id).lean()).scenes[0].clips[0].selectedDialogueId,
+    null
+  );
+});
+
+test('applying corrected voice directions supersedes old auditions and automatically queues the saved description', async (t) => {
+  const originalKey = process.env.ELEVENLABS_API_KEY;
+  process.env.ELEVENLABS_API_KEY = 'test-key';
+  t.after(() => {
+    if (originalKey === undefined) delete process.env.ELEVENLABS_API_KEY;
+    else process.env.ELEVENLABS_API_KEY = originalKey;
+  });
+  const descriptions = [],
+    mp3 = Buffer.from('ID3voice-correction-audio-data');
+  const automated = createProduction({
+    store: createSecretStore(join(directory, 'private')),
+    mediaDirectory: directory,
+    openart: {},
+    fetcher: async (_url, options) => {
+      descriptions.push(JSON.parse(options.body).voice_description);
+      return Response.json({
+        previews: [{ generated_voice_id: 'female-preview', audio_base_64: mp3.toString('base64') }]
+      });
+    }
+  });
+  const automation = createWorkflowAutomation(automated);
+  app.locals.assistant.production = automated;
+  app.locals.assistant.automation = automation;
+  const oldDescription = 'A generic cinematic character voice with natural clear speech.';
+  const femaleDescription =
+    'Kory is an adult woman with a slight, natural English accent. Clear feminine speech and expressive cinematic delivery. No music or sound effects.';
+  const voice = await withProject(key, async () => {
+    const media = await saveGeneratedMedia(directory, mp3, 'old-kory-audition.mp3', {
+      voiceDesign: { generatedVoiceId: 'old-preview' }
+    });
+    return StudioAsset.create({
+      name: 'Kory voice auditions',
+      aliases: ['KORY'],
+      kind: 'voice',
+      seedKey: `workflow-voice-${key}-kory`,
+      brief: oldDescription,
+      production: { voiceDescription: oldDescription },
+      candidates: [
+        {
+          id: 'old-male-audition',
+          title: 'Old audition',
+          description: oldDescription,
+          mediaIds: [media._id],
+          generatedVoiceId: 'old-preview',
+          voiceModel: 'eleven_v3'
+        }
+      ],
+      reviewStatus: 'pending-choice'
+    });
+  });
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    {
+      $set: {
+        'scenes.0.clips.0.dialogue': 'KORY: Good luck.',
+        'scenes.0.clips.0.production.mode': 'voice-reference'
+      }
+    }
+  );
+  for (const stage of ['source', 'brief', 'reference:profile']) await review(assetTarget(), stage);
+  for (const stage of ['source', 'outline']) await review(episodeTarget(), stage);
+  for (const stage of ['script', 'shot-plan']) await review(sceneTarget(), stage);
+  assert.equal(await Job.countDocuments({ kind: 'voice' }), 0);
+  const proposal = await withProject(key, () =>
+    productionProposal(new mongoose.Types.ObjectId(), {
+      scope: 'asset',
+      recordId: String(voice._id),
+      title: 'Kory is female with a slight English accent',
+      explanation: 'Owner rejected the male auditions. Use the corrected female voice directions.',
+      production: {
+        voiceDescription: femaleDescription,
+        sourceNotes: 'Owner-confirmed female voice and slight English accent.',
+        items: []
+      }
+    })
+  );
+  const applied = await request(app)
+    .post(base + '/assistant/proposals/' + proposal._id + '/apply')
+    .set(headers)
+    .send({})
+    .expect(200);
+  assert.equal(applied.body.automation.status, 'queued');
+  let saved = await StudioAsset.findById(voice._id).lean();
+  assert.equal(saved.brief, femaleDescription);
+  assert.equal(saved.production.voiceDescription, femaleDescription);
+  assert.equal(saved.production.managed, false);
+  assert.ok(saved.candidates[0].archived);
+  assert.ok(await StudioMedia.exists({ _id: saved.candidates[0].mediaIds[0] }));
+  await automation.processNext();
+  const job = await Job.findOne({ kind: 'voice' }).lean();
+  assert.equal(job.payload.description, femaleDescription);
+  assert.equal(String(job.chatId), String(proposal.chatId));
+  await automated.processJob(job);
+  assert.deepEqual(descriptions, [femaleDescription]);
+  saved = await StudioAsset.findById(voice._id).lean();
+  assert.equal(saved.candidates.filter((candidate) => !candidate.archived).length, 1);
+  assert.equal(saved.finalChoice, null);
+  await automation.reconcileProduction();
+  await automation.processNext();
+  assert.equal(await Job.countDocuments({ kind: 'voice' }), 1);
+  const editedDescription = femaleDescription + ' Softer delivery.';
+  const edited = await request(app)
+    .put(base + '/assets/' + voice._id)
+    .set(headers)
+    .send({ ...saved, brief: editedDescription })
+    .expect(200);
+  assert.equal(edited.body.asset.production.voiceDescription, editedDescription);
+  assert.equal(edited.body.automation.status, 'queued');
+  assert.ok(edited.body.asset.candidates.every((candidate) => candidate.archived));
+});
+
+test('an unknown voice-design submission is retained and never automatically submitted again', async (t) => {
+  const originalKey = process.env.ELEVENLABS_API_KEY;
+  process.env.ELEVENLABS_API_KEY = 'test-key';
+  t.after(() => {
+    if (originalKey === undefined) delete process.env.ELEVENLABS_API_KEY;
+    else process.env.ELEVENLABS_API_KEY = originalKey;
+  });
+  let attempts = 0;
+  const automated = createProduction({
+    store: createSecretStore(join(directory, 'private')),
+    mediaDirectory: directory,
+    openart: {},
+    fetcher: async () => {
+      attempts++;
+      throw new Error('Connection lost after submission');
+    }
+  });
+  const automation = createWorkflowAutomation(automated);
+  app.locals.assistant.automation = automation;
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    {
+      $set: {
+        'scenes.0.clips.0.dialogue': 'HARKUN: Leave.',
+        'scenes.0.clips.0.production.mode': 'voice-reference'
+      }
+    }
+  );
+  for (const stage of ['source', 'brief', 'reference:profile']) await review(assetTarget(), stage);
+  for (const stage of ['source', 'outline']) await review(episodeTarget(), stage);
+  for (const stage of ['script', 'shot-plan']) await review(sceneTarget(), stage);
+  await automation.processNext();
+  const job = await Job.findOne({ kind: 'voice' }).lean();
+  assert.ok(job);
+  await automated.processJob(job);
+  assert.equal((await Job.findById(job._id).lean()).status, 'uncertain');
+  await automation.reconcileProduction();
+  await automation.processNext();
+  await automated.processJob(job);
+  assert.equal(await Job.countDocuments({ kind: 'voice' }), 1);
+  assert.equal(attempts, 1);
+});
+
+test('image reference budgeting preserves primary references and records omitted fallback views', async () => {
+  await withProject(key, async () => {
+    const refs = [];
+    for (let i = 0; i < 20; i++)
+      refs.push(
+        String(
+          (
+            await saveGeneratedMedia(directory, png, `reference-${i}.png`, {
+              providerReference: {
+                id: `reference-${i}`,
+                url: `https://cdn.openart.ai/reference-${i}.png`
+              }
+            })
+          )._id
+        )
+      );
+    await StudioAsset.updateOne(
+      { _id: asset._id },
+      {
+        $set: {
+          kind: 'prop',
+          identitySourceMediaIds: refs,
+          finalChoice: null,
+          'production.items.0.mediaId': null
+        }
+      }
+    );
+    await review(assetTarget(), 'source');
+    await review(assetTarget(), 'brief');
+    const job = await production.queue({
+      kind: 'image',
+      requestId: 'reference-budget',
+      target: { assetId: String(asset._id), packageItemId: 'profile' }
+    });
+    const built = await production.build(job);
+    assert.equal(built.params.visualReferences.length, 16);
+    const saved = await Job.findById(job._id).lean();
+    assert.deepEqual(saved.payload.referenceSelection.selected, refs.slice(0, 16));
+    assert.deepEqual(saved.payload.referenceSelection.omitted, refs.slice(16));
+  });
+  assert.deepEqual(calls, []);
+});
+
+test('recovery resumes a reference-budget preparation failure once without retrying submitted renders', async () => {
+  await prepare();
+  await StudioAutomation.deleteMany({});
+  await StudioAsset.updateOne(
+    { episodeId: episode._id, clipId: 'shot' },
+    { $set: { finalChoice: null } }
+  );
+  const automation = app.locals.assistant.automation;
+  const step = await withProject(key, async () =>
+    (await automation.plan(sceneTarget())).find((step) => step.kind === 'image')
+  );
+  assert.ok(step);
+  const failed = await withProject(key, () =>
+    Job.create({
+      ...step,
+      status: 'failed',
+      error: 'Too many image references; select fewer references for this request.'
+    })
+  );
+  await automation.reconcileProduction();
+  await automation.reconcileProduction();
+  await automation.processNext();
+  assert.equal(await Job.countDocuments({ kind: 'image' }), 2);
+  const replacement = await Job.findOne({ retryOf: String(failed._id) }).lean();
+  assert.ok(replacement);
+  assert.equal(replacement.status, 'queued');
+  await automation.reconcileProduction();
+  await automation.processNext();
+  assert.equal(await Job.countDocuments({ kind: 'image' }), 2);
+  assert.deepEqual(calls, []);
 });
 
 test('scene automation waits for animatic and sound approval before requesting any video', async () => {
@@ -2593,7 +3880,10 @@ test('non-dialogue Wan requests enable native effects and ambience without promp
   assert.equal(submitted.settings.params.audio, true);
   assert.equal(submitted.settings.params.resolution, '1080p');
   assert.equal(submitted.snapshot.audioPolicy, nativeAudioPolicy);
-  assert.match(submitted.settings.params.prompt, /Generate synchronized sound effects/);
+  assert.match(
+    submitted.settings.params.prompt,
+    /Generate location ambience and action sounds with the picture/
+  );
   assert.match(submitted.settings.params.prompt, /No music, score/);
   assert.equal(submitted.settings.params.promptExtend, false);
   assert.equal(submitted.settings.mode, 'image2video');
@@ -2819,8 +4109,8 @@ test('a scene spanning orbit and surface cannot approve ambiguous shot locations
   );
   const overview = await request(app).get(base).set(headers).expect(200);
   assert.ok(
-    !overview.body.workflowReviews.some((row) =>
-      ['storyboard', 'animatic', 'sound-plan'].includes(row.stage)
+    !overview.body.workflowReviews.some(
+      (row) => ['storyboard', 'animatic', 'sound-plan'].includes(row.stage) && !row.canApprove
     ),
     'Blocked downstream stages are not actionable pending choices.'
   );
@@ -3005,85 +4295,145 @@ test('whole-scene storyboard and animatic approvals cover each clip without dupl
   }
 });
 
-test('revising a different shot preserves finalized compositions and accepted native video without new approvals', async () => {
-  const first = JSON.parse(JSON.stringify(episode.scenes[0].clips[0]));
-  const second = { ...first, id: 'second', title: 'Landing', takeIds: [] };
-  await StudioEpisode.updateOne(
-    { _id: episode._id },
-    { $set: { 'scenes.0.clips': [first, second] } }
-  );
-  const secondImage = await withProject(key, () =>
-    StudioAsset.create({
-      name: 'Landing image',
-      kind: 'environment',
-      scope: 'episode',
-      episodeId: episode._id,
-      sceneId: 'scene',
-      clipId: 'second',
-      finalChoice: { id: 'second-image', mediaIds: [image._id] }
-    })
-  );
-  await prepare();
-  await StudioMedia.updateOne(
-    { _id: video._id },
-    {
-      $set: {
-        nativeAudio: {
-          policy: nativeAudioPolicy,
-          episodeId: String(episode._id),
-          sceneId: 'scene',
-          clipId: 'shot'
+for (const clipScoped of [false, true])
+  test(`adding a character for another shot preserves accepted work (${clipScoped ? 'clip-scoped' : 'scene-wide'})`, async () => {
+    const first = JSON.parse(JSON.stringify(episode.scenes[0].clips[0]));
+    const second = { ...first, id: 'second', title: 'Landing', takeIds: [] };
+    await StudioEpisode.updateOne(
+      { _id: episode._id },
+      { $set: { 'scenes.0.clips': [first, second] } }
+    );
+    const secondImage = await withProject(key, () =>
+      StudioAsset.create({
+        name: 'Landing image',
+        kind: 'environment',
+        scope: 'episode',
+        episodeId: episode._id,
+        sceneId: 'scene',
+        clipId: 'second',
+        finalChoice: { id: 'second-image', mediaIds: [image._id] }
+      })
+    );
+    await prepare();
+    await StudioMedia.updateOne(
+      { _id: video._id },
+      {
+        $set: {
+          nativeAudio: {
+            policy: nativeAudioPolicy,
+            episodeId: String(episode._id),
+            sceneId: 'scene',
+            clipId: 'shot'
+          }
         }
       }
+    );
+    const row = await state(clipTarget(), 'visual');
+    await request(app)
+      .post(base + '/workflow/review')
+      .set(headers)
+      .send({ ...row, action: 'approve', takeId: String(video._id) })
+      .expect(200);
+    const before = await StudioEpisode.findById(episode._id).lean();
+    const composition = await StudioAsset.findOne({
+      episodeId: episode._id,
+      clipId: 'shot'
+    }).lean();
+    const extra = await withProject(key, () =>
+      saveGeneratedMedia(directory, png, 'kory-reference.png')
+    );
+    const kory = await withProject(key, () =>
+      StudioAsset.create({
+        name: 'Kory',
+        kind: 'character',
+        finalChoice: { id: 'kory', mediaIds: [extra._id] },
+        production: { managed: false, items: [] }
+      })
+    );
+    const chat = clipScoped
+      ? await withProject(key, () =>
+          Chat.create({
+            title: 'Fix second image',
+            context: { episodeId: String(episode._id), sceneId: 'scene', clipId: 'second' }
+          })
+        )
+      : null;
+    const scene = JSON.parse(JSON.stringify(before.scenes[0]));
+    scene.assetIds.push(String(kory._id));
+    scene.script += '\nThe landing shot changes; the door shot is unchanged.';
+    if (clipScoped) scene.clips[0].action = 'An unrelated rewrite must be ignored.';
+    scene.clips[1].action = 'Deploy gear before descending.';
+    scene.clips[1].duration = 5;
+    const proposal = await withProject(key, () =>
+      makeProposal(chat?._id, {
+        episodeId: String(episode._id),
+        title: 'Revise landing only',
+        explanation: 'Revise only the second shot.',
+        scene
+      })
+    );
+    assert.deepEqual(
+      proposal.scene.clips[0].production.referenceAssetIds,
+      before.scenes[0].assetIds.map(String)
+    );
+    assert.equal(proposal.scene.clips[0].action, before.scenes[0].clips[0].action);
+    if (clipScoped) assert.equal(proposal.scene.script, before.scenes[0].script);
+    await request(app)
+      .post(base + '/assistant/proposals/' + proposal._id + '/apply')
+      .set(headers)
+      .send({})
+      .expect(200);
+    const after = await StudioEpisode.findById(episode._id).lean();
+    const allAssets = await StudioAsset.find().lean();
+    const intentionallyRevised = {
+      ...after.scenes[0].clips[0],
+      production: { ...after.scenes[0].clips[0].production, referenceMediaIds: [String(extra._id)] }
+    };
+    assert.ok(
+      clipPrompts(
+        after.scenes[0],
+        intentionallyRevised,
+        allAssets,
+        after
+      ).referenceMediaIds.includes(String(extra._id))
+    );
+    assert.ok(
+      !clipPrompts(
+        after.scenes[0],
+        after.scenes[0].clips[0],
+        allAssets,
+        after
+      ).referenceMediaIds.includes(String(extra._id))
+    );
+    assert.ok(
+      clipPrompts(
+        after.scenes[0],
+        after.scenes[0].clips[1],
+        allAssets,
+        after
+      ).referenceMediaIds.includes(String(extra._id))
+    );
+    assert.deepEqual(
+      (await StudioAsset.findById(composition._id).lean()).finalChoice,
+      composition.finalChoice
+    );
+    assert.equal((await StudioAsset.findById(secondImage._id).lean()).finalChoice, null);
+    for (const stage of ['storyboard', 'animatic', 'visual']) {
+      const kept = await state(clipTarget(), stage);
+      assert.equal(kept.status, 'approved', stage);
+      assert.equal(kept.retainedApproval, true, stage);
+      assert.deepEqual(kept.blockers, []);
     }
-  );
-  const row = await state(clipTarget(), 'visual');
-  await request(app)
-    .post(base + '/workflow/review')
-    .set(headers)
-    .send({ ...row, action: 'approve', takeId: String(video._id) })
-    .expect(200);
-  const before = await StudioEpisode.findById(episode._id).lean();
-  const composition = await StudioAsset.findOne({ episodeId: episode._id, clipId: 'shot' }).lean();
-  const scene = JSON.parse(JSON.stringify(before.scenes[0]));
-  scene.script += '\nThe landing shot changes; the door shot is unchanged.';
-  scene.clips[1].action = 'Deploy gear before descending.';
-  scene.clips[1].duration = 5;
-  const proposal = await withProject(key, () =>
-    makeProposal(undefined, {
-      episodeId: String(episode._id),
-      title: 'Revise landing only',
-      explanation: 'Revise only the second shot.',
-      scene
-    })
-  );
-  await request(app)
-    .post(base + '/assistant/proposals/' + proposal._id + '/apply')
-    .set(headers)
-    .send({})
-    .expect(200);
-  const after = await StudioEpisode.findById(episode._id).lean();
-  assert.deepEqual(
-    (await StudioAsset.findById(composition._id).lean()).finalChoice,
-    composition.finalChoice
-  );
-  assert.equal((await StudioAsset.findById(secondImage._id).lean()).finalChoice, null);
-  for (const stage of ['storyboard', 'animatic', 'visual']) {
-    const kept = await state(clipTarget(), stage);
-    assert.equal(kept.status, 'approved', stage);
-    assert.equal(kept.retainedApproval, true, stage);
-    assert.deepEqual(kept.blockers, []);
-  }
-  assert.equal(String(after.scenes[0].clips[0].selectedTakeId), String(video._id));
-  assert.notEqual(
-    (await state(at('clip', episode._id, 'scene', 'second'), 'storyboard')).status,
-    'approved'
-  );
-  await withProject(key, () =>
-    validateMixedSelection(after, after.scenes[0], after.scenes[0].clips[0])
-  );
-  assert.equal(await Job.countDocuments(), 0);
-});
+    assert.equal(String(after.scenes[0].clips[0].selectedTakeId), String(video._id));
+    assert.notEqual(
+      (await state(at('clip', episode._id, 'scene', 'second'), 'storyboard')).status,
+      'approved'
+    );
+    await withProject(key, () =>
+      validateMixedSelection(after, after.scenes[0], after.scenes[0].clips[0])
+    );
+    assert.equal(await Job.countDocuments(), 0);
+  });
 
 test('timing changes retain the composition review but reopen that shot timing and video acceptance', async () => {
   await prepare();
@@ -3098,6 +4448,33 @@ test('timing changes retain the composition review but reopen that shot timing a
   assert.notEqual((await state(clipTarget(), 'visual')).status, 'approved');
   assert.ok(
     (await StudioAsset.findOne({ episodeId: episode._id, clipId: 'shot' }).lean()).finalChoice
+  );
+});
+test('movement-only corrections retain the still and sound approvals while reopening the changed animatic', async () => {
+  await prepare();
+  const imageBefore = (await StudioAsset.findOne({ episodeId: episode._id, clipId: 'shot' }).lean())
+    .finalChoice;
+  const soundBefore = await state(sceneTarget(), 'sound-plan');
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    {
+      $set: {
+        'scenes.0.clips.0.production.startState': 'Standing at the approved marks.',
+        'scenes.0.clips.0.production.allowedMotion': 'Only speak; hold positions and camera.',
+        'scenes.0.clips.0.production.endState': 'Same marks for the next stage.'
+      }
+    }
+  );
+  assert.equal((await state(clipTarget(), 'storyboard')).status, 'approved');
+  assert.notEqual((await state(clipTarget(), 'animatic')).status, 'approved');
+  assert.equal((await state(sceneTarget(), 'sound-plan')).status, 'approved');
+  assert.equal(
+    (await state(sceneTarget(), 'sound-plan')).approvalFingerprint,
+    soundBefore.approvalFingerprint
+  );
+  assert.deepEqual(
+    (await StudioAsset.findOne({ episodeId: episode._id, clipId: 'shot' }).lean()).finalChoice,
+    imageBefore
   );
 });
 
@@ -3390,6 +4767,502 @@ async function prepareIndividualShots() {
     assert.equal((await review(sceneTarget(), stage)).status, 200);
 }
 
+async function jointShotReview() {
+  const reviews = {};
+  for (const stage of ['storyboard', 'animatic']) {
+    const row = await state(clipTarget(), stage);
+    reviews[stage] = {
+      approvalFingerprint: row.approvalFingerprint,
+      reviewRevision: row.reviewRevision
+    };
+  }
+  return {
+    target: clipTarget(),
+    parentRevision: (await StudioEpisode.findById(episode._id).lean()).revision,
+    reviews
+  };
+}
+
+test('scene-local saves retain other scenes and generated files, preserve custom prompts, and do not start paid work', async () => {
+  const later = JSON.parse(JSON.stringify(episode.scenes[0]));
+  later.id = 'later';
+  later.clips[0].id = 'later-shot';
+  await StudioEpisode.updateOne({ _id: episode._id }, { $push: { scenes: later } });
+  await prepare();
+  const board = (
+    await request(app)
+      .post(base + '/workflow/board')
+      .set(headers)
+      .send({ target: episodeTarget() })
+      .expect(200)
+  ).body;
+  const original = await StudioEpisode.findById(episode._id).lean();
+  const scene = structuredClone(board.record.scenes[1]);
+  scene.clips[0].production.imagePrompt =
+    'Exact editable Star Wars image prompt. Preserve the approved character.';
+  scene.clips[0].production.videoPrompt = 'Animate only the selected frame. No exits or music.';
+  const body = {
+    target: { scope: 'scene', recordId: String(episode._id), sceneId: 'later' },
+    editToken: scene.editToken,
+    scene
+  };
+  // An unrelated episode revision is compatible with this scene edit token.
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    { $set: { synopsis: 'An unrelated summary update.' }, $inc: { revision: 1 } }
+  );
+  await request(app)
+    .post(base + '/workflow/scene/save')
+    .set(headers)
+    .send(body)
+    .expect((response) => assert.equal(response.status, 200, response.body.message));
+  const after = await StudioEpisode.findById(episode._id).lean();
+  assert.deepEqual(after.scenes[0], original.scenes[0]);
+  assert.equal(after.scenes[1].production.manualGeneration, true);
+  assert.equal(
+    after.scenes[1].clips[0].production.imagePrompt,
+    scene.clips[0].production.imagePrompt
+  );
+  assert.equal(
+    after.scenes[1].clips[0].production.videoPrompt,
+    scene.clips[0].production.videoPrompt
+  );
+  assert.deepEqual(after.scenes[1].clips[0].takeIds, original.scenes[1].clips[0].takeIds);
+  assert.equal(after.synopsis, 'An unrelated summary update.');
+  await request(app)
+    .post(base + '/workflow/scene/save')
+    .set(headers)
+    .send(body)
+    .expect(409);
+  assert.equal(await Job.countDocuments(), 0);
+});
+
+test('the image button quotes and sends the exact saved prompt once without automatically generating a video', async () => {
+  await prepare();
+  const board = (
+    await request(app)
+      .post(base + '/workflow/board')
+      .set(headers)
+      .send({ target: episodeTarget() })
+      .expect(200)
+  ).body;
+  const scene = board.record.scenes[0];
+  scene.clips[0].production.imagePrompt =
+    'Star Wars universe. Exact saved image prompt. Same approved adult, same door, 16:9. No text.';
+  await request(app)
+    .post(base + '/workflow/scene/save')
+    .set(headers)
+    .send({ target: sceneTarget(), editToken: scene.editToken, scene })
+    .expect((response) => assert.equal(response.status, 200, response.body.message));
+  const current = await StudioEpisode.findById(episode._id).lean();
+  const preview = (
+    await request(app)
+      .post(base + '/workflow/board')
+      .set(headers)
+      .send({ target: episodeTarget() })
+      .expect(200)
+  ).body.shotPrompts.find((shot) => shot.clipId === scene.clips[0].id);
+  assert.ok(preview.image.startsWith(scene.clips[0].production.imagePrompt));
+  assert.match(preview.image, /@image1:/);
+  const body = {
+    target: clipTarget(),
+    parentRevision: current.revision,
+    prompt: preview.image,
+    imageReferenceIds: preview.imageReferences.selected,
+    requestId: 'manual-image-button'
+  };
+  await request(app)
+    .post(base + '/workflow/shot/image')
+    .set(headers)
+    .send({ ...body, prompt: 'Wrong draft' })
+    .expect(409);
+  await request(app)
+    .post(base + '/workflow/shot/image')
+    .set(headers)
+    .send({ ...body, imageReferenceIds: ['stale-preview'] })
+    .expect(409);
+  const first = (
+    await request(app)
+      .post(base + '/workflow/shot/image')
+      .set(headers)
+      .send(body)
+      .expect(202)
+  ).body;
+  const repeated = (
+    await request(app)
+      .post(base + '/workflow/shot/image')
+      .set(headers)
+      .send(body)
+      .expect(202)
+  ).body;
+  assert.equal(first.jobId, repeated.jobId);
+  await production.processJob(await Job.findById(first.jobId).lean());
+  const job = await Job.findById(first.jobId).lean();
+  assert.equal(job.status, 'rendering', job.error);
+  assert.equal(job.settings.params.prompt, body.prompt);
+  assert.match(job.settings.params.visualReferences[0].label, /^image1 - /);
+  assert.ok(
+    job.settings.params.visualReferences.every((reference) => !reference.label.startsWith('@'))
+  );
+  assert.equal(await Job.countDocuments({ kind: 'video' }), 0);
+  assert.ok(
+    !(await withProject(key, () => app.locals.assistant.automation.plan(sceneTarget()))).some(
+      (step) => ['image', 'video'].includes(step.kind)
+    )
+  );
+});
+
+test('scene image selections persist exact attachments and an empty selection without changing other shot inputs', async () => {
+  await prepare();
+  async function board() {
+    return (
+      await request(app)
+        .post(base + '/workflow/board')
+        .set(headers)
+        .send({ target: episodeTarget() })
+        .expect(200)
+    ).body;
+  }
+  const before = await board();
+  const original = before.record.scenes[0];
+  const siblings = structuredClone(original.clips.slice(1));
+  const sixteen = await withProject(key, () =>
+    Promise.all(
+      Array.from({ length: 16 }, (_, i) =>
+        StudioMedia.create({
+          ...image,
+          _id: undefined,
+          originalName: `reference-${i}.png`,
+          metadata: {
+            ...image.metadata,
+            providerReference: { id: `fake-image-${i}`, url: 'https://cdn.openart.ai/fake.png' }
+          }
+        })
+      )
+    )
+  );
+  for (const ids of [[String(image._id)], sixteen.map((file) => String(file._id)), []]) {
+    const current = await board();
+    const scene = current.record.scenes[0];
+    scene.clips[0].production.imageReferenceMediaIds = ids;
+    scene.clips[0].production.imagePrompt = 'Exact image directions.';
+    await request(app)
+      .post(base + '/workflow/scene/save')
+      .set(headers)
+      .send({ target: sceneTarget(), editToken: scene.editToken, scene })
+      .expect(200);
+    const updated = await board();
+    assert.deepEqual(updated.record.scenes[0].clips[0].production.imageReferenceMediaIds, ids);
+    assert.deepEqual(updated.record.scenes[0].clips.slice(1), siblings);
+    assert.deepEqual(
+      updated.record.scenes[0].clips[0].production.referenceMediaIds,
+      original.clips[0].production.referenceMediaIds
+    );
+    const preview = updated.shotPrompts.find((shot) => shot.clipId === scene.clips[0].id);
+    assert.deepEqual(preview.imageReferences.selected, ids);
+    if (!ids.length) assert.equal(preview.image, 'Exact image directions.');
+    else assert.match(preview.image, /@image1:/);
+  }
+  assert.equal(await Job.countDocuments(), 0);
+});
+test('the explicit video button uses the saved video prompt, retains an existing take, and queues only one replacement', async () => {
+  await prepareIndividualShots();
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    { $set: { 'scenes.0.clips.0.takeIds': [video._id] } }
+  );
+  const board = (
+    await request(app)
+      .post(base + '/workflow/board')
+      .set(headers)
+      .send({ target: episodeTarget() })
+      .expect(200)
+  ).body;
+  const scene = board.record.scenes[0];
+  scene.clips[0].production.videoPrompt =
+    'Star Wars universe. Animate the approved frame. Locked camera and fixed background. The character stays planted. Wind ambience, no speech or music.';
+  await request(app)
+    .post(base + '/workflow/scene/save')
+    .set(headers)
+    .send({ target: sceneTarget(), editToken: scene.editToken, scene })
+    .expect(200);
+  const body = {
+    ...(await jointShotReview()),
+    generate: true,
+    prompt: (
+      await request(app)
+        .post(base + '/workflow/board')
+        .set(headers)
+        .send({ target: episodeTarget() })
+        .expect(200)
+    ).body.shotPrompts.find((shot) => shot.clipId === scene.clips[0].id).video,
+    requestId: 'explicit-video-replacement'
+  };
+  await request(app)
+    .post(base + '/workflow/shot/approve')
+    .set(headers)
+    .send({ ...body, prompt: 'Unsaved text' })
+    .expect(409);
+  const response = (
+    await request(app)
+      .post(base + '/workflow/shot/approve')
+      .set(headers)
+      .send(body)
+      .expect(202)
+  ).body;
+  assert.equal(await Job.countDocuments({ kind: 'video' }), 1);
+  const repeated = (
+    await request(app)
+      .post(base + '/workflow/shot/approve')
+      .set(headers)
+      .send(body)
+      .expect(200)
+  ).body;
+  assert.equal(repeated.jobId, response.jobId);
+  const job = await Job.findById(response.jobId).lean();
+  await production.processJob(job);
+  const submitted = await Job.findById(job._id).lean();
+  assert.equal(submitted.status, 'rendering', submitted.error);
+  assert.equal(submitted.settings.params.prompt, body.prompt);
+  assert.ok(
+    (await StudioEpisode.findById(episode._id).lean()).scenes[0].clips[0].takeIds
+      .map(String)
+      .includes(String(video._id))
+  );
+  assert.equal(calls.filter((call) => call === 'openart_generate_video').length, 1);
+});
+
+test('one shot approval covers composition and timing and queues only that shot, with repeat clicks retaining the same reviews and job', async () => {
+  await prepareIndividualShots();
+  const board = (
+    await request(app)
+      .post(base + '/workflow/board')
+      .set(headers)
+      .send({ target: episodeTarget() })
+      .expect(200)
+  ).body;
+  assert.equal(board.layout, 'scenes');
+  assert.equal((await state(clipTarget(), 'storyboard')).status, 'pending-review');
+  const body = await jointShotReview();
+  const approved = await request(app)
+    .post(base + '/workflow/shot/approve')
+    .set(headers)
+    .send(body)
+    .expect(200);
+  assert.equal(approved.body.approved, true);
+  for (const stage of ['storyboard', 'animatic'])
+    assert.equal((await state(clipTarget(), stage)).status, 'approved');
+  const before = await StudioReview.find({ 'target.clipId': 'shot' })
+    .select('stage revision')
+    .lean();
+  await request(app)
+    .post(base + '/workflow/shot/approve')
+    .set(headers)
+    .send(body)
+    .expect(200);
+  assert.deepEqual(
+    await StudioReview.find({ 'target.clipId': 'shot' }).select('stage revision').lean(),
+    before
+  );
+  while (await StudioAutomation.exists({ status: 'queued' }))
+    await app.locals.assistant.automation.processNext();
+  const jobs = await Job.find({ kind: 'video' }).lean();
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].target.clipId, 'shot');
+  assert.equal(jobs[0].status, 'queued');
+  assert.notEqual(
+    (await state({ ...clipTarget(), clipId: 'unfinished' }, 'animatic')).status,
+    'approved'
+  );
+  assert.deepEqual(calls, []);
+});
+
+test('joint shot approval rejects stale reviewed inputs and uncertain submissions for this same shot', async () => {
+  await prepareIndividualShots();
+  const body = await jointShotReview();
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    {
+      $set: { 'scenes.0.clips.0.production.endState': 'Hold the final mark.' }
+    }
+  );
+  assert.match(
+    (
+      await request(app)
+        .post(base + '/workflow/shot/approve')
+        .set(headers)
+        .send(body)
+        .expect(409)
+    ).body.message,
+    /review changed/
+  );
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    { $unset: { 'scenes.0.clips.0.production.endState': '' } }
+  );
+  await withProject(key, () =>
+    Job.create({
+      kind: 'video',
+      status: 'uncertain',
+      requestId: 'other-in-flight',
+      target: { episodeId: String(episode._id), sceneId: 'scene', clipId: 'shot' }
+    })
+  );
+  assert.match(
+    (
+      await request(app)
+        .post(base + '/workflow/shot/approve')
+        .set(headers)
+        .send(body)
+        .expect(409)
+    ).body.message,
+    /This shot has a video submission with an unknown outcome/
+  );
+  assert.equal(await StudioReview.countDocuments({ 'target.scope': 'clip', state: 'approved' }), 0);
+  assert.deepEqual(calls, []);
+});
+test('an earlier shot can generate while a later shot has an unreviewed take and an active request', async () => {
+  await prepareIndividualShots();
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    { $set: { 'scenes.0.clips.1.takeIds': [video._id] } }
+  );
+  await withProject(key, () =>
+    Job.create({
+      kind: 'video',
+      status: 'rendering',
+      requestId: 'later-shot-active',
+      target: { episodeId: String(episode._id), sceneId: 'scene', clipId: 'unfinished' }
+    })
+  );
+  const board = (
+    await request(app)
+      .post(base + '/workflow/board')
+      .set(headers)
+      .send({ target: episodeTarget(), boardVersion: 3 })
+      .expect(200)
+  ).body;
+  const body = {
+    ...(await jointShotReview()),
+    generate: true,
+    prompt: board.shotPrompts.find((prompt) => prompt.clipId === 'shot').video,
+    requestId: 'earlier-shot-manual'
+  };
+  const result = (
+    await request(app)
+      .post(base + '/workflow/shot/approve')
+      .set(headers)
+      .send(body)
+      .expect(202)
+  ).body;
+  const job = await Job.findById(result.jobId).lean();
+  assert.equal(job.target.clipId, 'shot');
+  assert.equal(job.status, 'queued');
+  assert.notEqual(
+    (await state({ ...clipTarget(), clipId: 'unfinished' }, 'visual')).status,
+    'approved'
+  );
+  assert.equal((await Job.findOne({ requestId: 'later-shot-active' }).lean()).status, 'rendering');
+  assert.deepEqual(calls, []);
+});
+
+test('dialogue approval on the shot board saves only the selected take and rejects a foreign shot or stale episode', async () => {
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    {
+      $set: {
+        'scenes.0.clips.0.dialogue': 'ROXY: Hello.',
+        'scenes.0.clips.0.dialogueTakeIds': [String(audio._id)]
+      }
+    }
+  );
+  const before = await StudioEpisode.findById(episode._id).lean();
+  const body = {
+    target: clipTarget(),
+    parentRevision: before.revision,
+    mediaId: String(audio._id)
+  };
+  await request(app)
+    .post(base + '/workflow/shot/dialogue')
+    .set(headers)
+    .send({ ...body, mediaId: String(image._id) })
+    .expect(409);
+  const saved = (
+    await request(app)
+      .post(base + '/workflow/shot/dialogue')
+      .set(headers)
+      .send(body)
+      .expect(200)
+  ).body.episode;
+  assert.equal(saved.scenes[0].clips[0].selectedDialogueId, String(audio._id));
+  assert.equal(saved.revision, before.revision + 1);
+  assert.deepEqual(saved.scenes[0].clips[0].takeIds, before.scenes[0].clips[0].takeIds.map(String));
+  assert.equal(saved.scenes[0].script, before.scenes[0].script);
+  await request(app)
+    .post(base + '/workflow/shot/dialogue')
+    .set(headers)
+    .send(body)
+    .expect(409);
+  assert.equal(await Job.countDocuments(), 0);
+});
+
+test('an approved shot downloads without an episode package or music approval and remains approved when another scene changes', async () => {
+  await StudioProject.updateOne({ key }, { $set: { videoWorkflow: 'native-1080p' } });
+  const later = JSON.parse(JSON.stringify(episode.scenes[0]));
+  later.id = 'later-scene';
+  later.title = 'Later scene';
+  later.clips = [{ ...later.clips[0], id: 'later-shot', title: 'Later shot', takeIds: [] }];
+  await StudioEpisode.updateOne({ _id: episode._id }, { $push: { scenes: later } });
+  await prepare();
+  const path = base + '/workflow/shot/' + episode._id + '/scene/shot/video';
+  await request(app).get(path).set(headers).expect(200);
+  const bytes = await readFile(join(directory, 'native-1080.mp4'));
+  const native = await withProject(key, () =>
+    saveGeneratedMedia(directory, bytes, 'approved-opening.mp4', {
+      nativeAudio: {
+        policy: nativeAudioPolicy,
+        episodeId: String(episode._id),
+        sceneId: 'scene',
+        clipId: 'shot'
+      }
+    })
+  );
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    { $set: { 'scenes.0.clips.0.takeIds': [native._id] } }
+  );
+  const row = await state(clipTarget(), 'visual');
+  await request(app)
+    .post(base + '/workflow/review')
+    .set(headers)
+    .send({ ...row, action: 'approve', takeId: String(native._id) })
+    .expect(200);
+  const first = await request(app).get(path).set(headers).expect(200);
+  assert.match(first.headers['content-disposition'], /attachment;.*approved-opening\.mp4/);
+  assert.match(first.headers['content-type'], /video\/mp4/);
+  assert.notEqual((await state(episodeTarget(), 'export')).status, 'approved');
+  const before = await state(clipTarget(), 'visual');
+  const updated = await StudioEpisode.findById(episode._id).lean();
+  updated.scenes[1].script += ' A different staging direction.';
+  updated.scenes[1].clips[0].action = 'A new camera-side action for only the later scene.';
+  await request(app)
+    .put(base + '/episodes/' + episode._id)
+    .set(headers)
+    .send(updated)
+    .expect(200);
+  assert.equal((await state(clipTarget(), 'visual')).status, 'approved');
+  assert.equal(
+    (await state(clipTarget(), 'visual')).approvalFingerprint,
+    before.approvalFingerprint
+  );
+  await request(app).get(path).set(headers).expect(200);
+  await request(app)
+    .get(base + '/workflow/shot/' + episode._id + '/later-scene/later-shot/video')
+    .set(headers)
+    .expect(404);
+  assert.equal(await Job.countDocuments({ kind: 'video' }), 0);
+});
+
 test('individual storyboard unlocks timing, then timing queues one native video without sibling images or batch reviews', async () => {
   await prepareIndividualShots();
   let data = (await request(app).get(base).set(headers).expect(200)).body;
@@ -3435,7 +5308,7 @@ test('individual storyboard unlocks timing, then timing queues one native video 
   const rendered = await Job.findById(job._id).lean();
   assert.equal(rendered.status, 'rendering', rendered.error);
   assert.equal(rendered.settings.params.audio, true);
-  assert.match(rendered.settings.params.prompt, /No background music/);
+  assert.match(rendered.settings.params.prompt, /No music/);
   assert.equal(calls.filter((c) => c === 'openart_generate_video').length, 1);
   assert.notEqual((await state(sceneTarget(), 'animatic')).status, 'approved');
   assert.equal((await state(clipTarget(), 'animatic')).status, 'approved');

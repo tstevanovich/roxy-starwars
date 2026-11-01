@@ -20,7 +20,9 @@ import {
   proposalApplication,
   proposalBlocksReview
 } from '../../../shared/production-proposals.js';
+import { existingCharacterAsset } from '../asset-identity.js';
 import { Proposal } from '../assistant/models.js';
+import { voiceRevisionFields } from '../assistant/voice-production.js';
 import {
   approvedCharacterSheets,
   characterSheetInput,
@@ -231,7 +233,7 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
               }))
             ),
           ...episodes.flatMap((e) => [
-            ...['source', 'outline', 'export'].map((stage) => ({
+            ...['source', 'outline'].map((stage) => ({
               ...workflow.evaluate({ scope: 'episode', recordId: String(e._id) }, stage),
               name: e.title
             })),
@@ -330,22 +332,29 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
     if (workflow) {
       const proposals = await Proposal.find({
         status: 'pending',
-        episodeId: { $in: episodes.map((e) => String(e._id)) }
+        $or: [
+          { episodeId: { $in: episodes.map((e) => String(e._id)) } },
+          { assetId: { $in: assets.map((a) => String(a._id)) } }
+        ]
       }).lean();
       for (const proposal of proposals.filter(
         (proposal) =>
           proposalApplication(
             proposal,
-            episodes.find((episode) => String(episode._id) === proposal.episodeId)
+            proposal.assetId
+              ? assets.find((a) => String(a._id) === proposal.assetId)
+              : episodes.find((episode) => String(episode._id) === proposal.episodeId)
           ).canApply
       )) {
-        const record = episodes.find((e) => String(e._id) === proposal.episodeId);
+        const record = proposal.assetId
+          ? assets.find((a) => String(a._id) === proposal.assetId)
+          : episodes.find((e) => String(e._id) === proposal.episodeId);
         // Applying a replacement is one task; do not also count the saved stage
         // that cannot be approved until this draft is applied or dismissed.
         for (let i = workflowReviews.length - 1; i >= 0; i--) {
           const row = workflowReviews[i];
           if (
-            row.target.recordId === proposal.episodeId &&
+            row.target.recordId === (proposal.assetId ?? proposal.episodeId) &&
             row.target.sceneId === proposal.scene?.id &&
             proposalBlocksReview(proposal, row.stage, record, row.target)
           )
@@ -353,9 +362,12 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
         }
         workflowReviews.push({
           key: 'proposal-' + proposal._id,
-          target: { scope: 'episode', recordId: proposal.episodeId },
+          target: {
+            scope: proposal.assetId ? 'asset' : 'episode',
+            recordId: proposal.assetId ?? proposal.episodeId
+          },
           title: proposal.title,
-          name: episodes.find((e) => String(e._id) === proposal.episodeId)?.title,
+          name: record.name ?? record.title,
           stage: 'story-draft',
           status: 'pending-review',
           chatId: String(proposal.chatId)
@@ -383,8 +395,23 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
               (row) => row.target.scope !== 'asset' && row.target.recordId === String(e._id)
             ).length;
             view.workflowReady =
-              workflow.evaluate({ scope: 'episode', recordId: String(e._id) }, 'export').status ===
-              'approved';
+              e.scenes.length > 0 &&
+              e.scenes.every(
+                (scene) =>
+                  scene.clips.length > 0 &&
+                  scene.clips.every(
+                    (clip) =>
+                      workflow.evaluate(
+                        {
+                          scope: 'clip',
+                          recordId: String(e._id),
+                          sceneId: scene.id,
+                          clipId: clip.id
+                        },
+                        'visual'
+                      ).status === 'approved'
+                  )
+              );
             for (const s of view.scenes) {
               const target = { scope: 'scene', recordId: String(e._id), sceneId: s.id };
               s.approvalStatus = workflow.evaluate(target, 'script').status;
@@ -447,6 +474,8 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
   });
   router.post('/assets', async (req, res) => {
     const fields = assetInput(req.body);
+    const reusable = await existingCharacterAsset(fields);
+    if (reusable) return res.json({ asset: reusable, reusedExisting: true });
     if (workflowEnabled() && !fields.clipId) fields.production.managed = true;
     if (['character', 'droid'].includes(fields.kind)) {
       fields.sheetLayout = characterPackageLayout;
@@ -455,7 +484,11 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
     await referencedMedia([
       ...(fields.production.sourceMediaIds ?? []),
       ...fields.production.items
-        .flatMap((item) => [item.mediaId, ...(item.referenceMediaIds ?? [])])
+        .flatMap((item) => [
+          item.mediaId,
+          ...(item.referenceMediaIds ?? []),
+          ...(item.imageReferenceMediaIds ?? [])
+        ])
         .filter(Boolean)
     ]);
     await validateOrganization(fields);
@@ -466,6 +499,18 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
     )
       fields.sheetLayout = characterPackageLayout;
     const asset = await StudioAsset.create(fields);
+    const automation = req.app.locals.assistant?.automation;
+    if (
+      automation &&
+      workflowEnabled() &&
+      !asset.brief?.trim() &&
+      !asset.clipId &&
+      !['voice', 'sound'].includes(asset.kind)
+    )
+      await automation.schedule(
+        { scope: 'asset', recordId: String(asset._id) },
+        { assetCreated: String(asset._id) }
+      );
     res.status(201).json({ asset: asset.toObject() });
   });
   router.put('/assets/:id', async (req, res) => {
@@ -481,7 +526,8 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
           baseRevision: old.revision,
           baseProduction: old.production ?? {}
         },
-        { ...old, production: old.production ?? {} }
+        { ...old, production: old.production ?? {} },
+        { allowItemRemoval: true }
       );
       const context = await workflowContext();
       if (
@@ -498,9 +544,26 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
     await referencedMedia([
       ...(fields.production.sourceMediaIds ?? []),
       ...(fields.production.items ?? [])
-        .flatMap((item) => [item.mediaId, ...(item.referenceMediaIds ?? [])])
+        .flatMap((item) => [
+          item.mediaId,
+          ...(item.referenceMediaIds ?? []),
+          ...(item.imageReferenceMediaIds ?? [])
+        ])
         .filter(Boolean)
     ]);
+    if (old.kind === 'voice') {
+      if (
+        fields.brief !== old.brief &&
+        (!req.body.production?.voiceDescription ||
+          req.body.production.voiceDescription === old.production?.voiceDescription)
+      )
+        fields.production.voiceDescription = fields.brief;
+      if (fields.production.voiceDescription)
+        Object.assign(
+          fields,
+          voiceRevisionFields({ ...old, candidates: fields.candidates }, fields.production)
+        );
+    }
     await validateOrganization(fields, old._id);
     await referencedMedia(fields.candidates.flatMap((c) => c.mediaIds));
     const oldFields = assetInput(JSON.parse(JSON.stringify(old)));
@@ -513,14 +576,21 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
         ? { continuitySources: old.candidates.find((o) => o.id === c.id).continuitySources }
         : {})
     }));
-    res.json({
-      asset: await save(
-        StudioAsset,
-        old,
-        { ...fields, finalChoice: organizationOnly ? old.finalChoice : null },
-        organizationOnly
-      )
-    });
+    const asset = await save(
+      StudioAsset,
+      old,
+      { ...fields, finalChoice: organizationOnly ? old.finalChoice : null },
+      organizationOnly
+    );
+    const automation =
+      old.kind === 'voice' &&
+      fields.production.voiceDescription !== old.production?.voiceDescription
+        ? await req.app.locals.assistant.automation.afterApproval(
+            { scope: 'asset', recordId: String(old._id) },
+            { voiceDirectionsSaved: asset.revision }
+          )
+        : [];
+    res.json({ asset, ...(automation.length ? { automation: automation[0] } : {}) });
   });
   router.patch('/assets/:id/organization', async (req, res) => {
     object(req.body);
@@ -578,7 +648,7 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
   router.post('/assets/:id/finalize', async (req, res) => {
     object(req.body);
     const old = await existing(StudioAsset, req.params.id, req.body.revision);
-    const candidate = old.candidates.find((c) => c.id === req.body.candidateId && !c.archived);
+    let candidate = old.candidates.find((c) => c.id === req.body.candidateId && !c.archived);
     if (!candidate || !candidate.mediaIds.length)
       fail('Attach and save reference media before finalizing this option.');
     const media = await referencedMedia(candidate.mediaIds);
@@ -594,6 +664,8 @@ export function createStudioRouter({ mediaDirectory = defaultMediaDirectory } = 
     )
       fail('A finalized visual asset needs an image or video reference.');
     const finalizedAt = new Date();
+    if (old.kind === 'voice' && candidate.generatedVoiceId)
+      candidate = await req.app.locals.assistant.production.voices.finalize(old, candidate);
     const generatedSheet =
       ['character', 'droid', 'prop'].includes(old.kind) &&
       media.length === 1 &&

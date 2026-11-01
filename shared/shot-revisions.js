@@ -1,4 +1,6 @@
 import { continuityInput } from './shot-continuity.js';
+import { shotAssetIds } from './shot-references.js';
+import { motionInput } from './video-readiness.js';
 
 // Scene narration and playback length do not change an unchanged shot composition.
 export function shotImageInputs(scene, clip) {
@@ -12,8 +14,12 @@ export function shotImageInputs(scene, clip) {
     action: clip.action ?? '',
     camera: clip.camera ?? '',
     framing: p.framing ?? '',
+    ...(p.imagePrompt ? { imagePrompt: p.imagePrompt } : {}),
+    ...(p.imageReferenceMediaIds !== undefined
+      ? { imageReferenceMediaIds: p.imageReferenceMediaIds }
+      : {}),
     ...continuityInput(p),
-    references: (p.referenceMediaIds?.length ? p.referenceMediaIds : (scene?.assetIds ?? []))
+    references: (p.referenceMediaIds?.length ? p.referenceMediaIds : shotAssetIds(scene, clip))
       .map(String)
       .sort()
   };
@@ -38,7 +44,11 @@ export function shotRevisionImpact(before, after) {
     c?.dialogue ?? '',
     c?.production?.mode ?? '',
     c?.production?.beats ?? '',
-    c?.production?.passCondition ?? ''
+    c?.production?.passCondition ?? '',
+    motionInput(c?.production),
+    c?.production?.videoPrompt || '',
+    c?.production?.videoTransitionPrompt || '',
+    c?.production?.videoEndFrame ?? null
   ];
   const audio = (s, c) => [
     c?.soundEffects ?? '',

@@ -112,3 +112,34 @@ test('unsaved asset changes do not block approving a saved sheet', async () => {
     body: { revision: 3 }
   });
 });
+
+test.each([
+  [[], 'Go to reference setup', '#asset-reference-setup-al'],
+  [
+    [{ id: 'body-turnaround', type: 'image', mediaId: null }],
+    'Go to body turnaround',
+    '#asset-image-generation-al--body-turnaround'
+  ],
+  [
+    [{ id: 'body-turnaround', type: 'image', mediaId: 'turnaround' }],
+    'Review body turnaround',
+    '#review-asset--al------reference_3a_body-turnaround'
+  ]
+])('package sheet navigation follows the actual next step', (items, label, href) => {
+  const pending = {
+    ...asset,
+    kind: 'character',
+    sheetLayout: 'production-package',
+    finalChoice: null,
+    characterSheets: [],
+    production: { items }
+  };
+  render(
+    <ThemeProvider theme={theme}>
+      <CharacterSheets asset={pending} media={media} onSaved={vi.fn()} />
+    </ThemeProvider>
+  );
+  expect(screen.getByRole('link', { name: label })).toHaveAttribute('href', href);
+  expect(screen.queryByRole('link', { name: 'Go to finalization' })).not.toBeInTheDocument();
+  expect(request).not.toHaveBeenCalled();
+});

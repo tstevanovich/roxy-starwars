@@ -29,7 +29,7 @@ test('package image prompts exclude asset biographies, research and other delive
   assert.match(prompt, /Star Wars universe, Old Republic era/);
   assert.match(prompt, /full-body FRONT/);
   assert.match(prompt, /Red tunic and black trousers/);
-  assert.match(prompt, /first reference is the approved master portrait/);
+  assert.match(prompt, /@image1 is the approved master portrait/);
   for (const phrase of [
     'UNFINALIZED',
     'Four-panel',
@@ -162,14 +162,16 @@ test('each clip keeps its own instructions without copying other dialogue or ass
   assert.equal(result.videoWithinLimit, true);
   assert.ok(result.video.length <= 4500);
   assert.ok(result.video.includes(clip.action));
-  assert.ok(result.video.includes(clip.dialogue));
+  assert.match(result.video, /AL says: "He handles docking clearances\."/);
   assert.ok(result.video.includes(clip.camera));
   assert.ok(result.video.includes(clip.soundEffects));
   assert.ok(!result.video.includes('another clip’s dialogue'));
   for (const prompt of [result.image, result.video]) {
     assert.ok(!prompt.includes('PENDING YOUR REVIEW'));
     assert.ok(!prompt.includes('Old model comparison'));
-    for (const asset of assets) assert.ok(prompt.includes(asset.name));
+    for (const asset of assets.filter((asset) => asset.kind !== 'voice'))
+      assert.ok(prompt.includes(asset.name));
+    assert.ok(!prompt.includes(assets[0].name));
   }
   assert.deepEqual(
     result.referenceMediaIds,
@@ -204,7 +206,6 @@ test('production video prompts preserve exact shot instructions without appendin
   const prompt = productionVideoPrompt(scene, clip, instructions);
   for (const direction of [
     clip.action,
-    clip.dialogue,
     clip.camera,
     clip.soundEffects,
     instructions,
@@ -214,7 +215,8 @@ test('production video prompts preserve exact shot instructions without appendin
   assert.match(prompt, /Star Wars universe, Imperial era/);
   assert.match(prompt, /No conventional cars or wheeled vehicles/);
   assert.match(prompt, /No music, score/);
-  assert.ok(prompt.endsWith('Music is added later in CapCut.'));
+  assert.match(prompt, /AL says: "The charter is for one passenger\."/);
+  assert.ok(!prompt.includes('CapCut'));
   assert.ok(prompt.length < 4500);
 });
 

@@ -13,7 +13,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { musicPrompt } from '../../shared/scene-music.js';
 import { request } from './api.js';
 import { focusSection } from './review-navigation.js';
-import { mediaUrl } from './studio-utils.js';
+import { mediaDownloadUrl, mediaUrl } from './studio-utils.js';
 
 export default function SceneMusic({ episode, scene, dirty, busy, onReload }) {
   const [data, setData] = useState(null),
@@ -59,6 +59,7 @@ export default function SceneMusic({ episode, scene, dirty, busy, onReload }) {
     ['queued', 'preparing', 'submitting', 'importing', 'uncertain'].includes(j.status)
   );
   const disabled = dirty || busy || working;
+  const complete = data?.takeReview.status === 'approved' && !edited;
   const total = data?.targetSeconds ?? 0,
     generated = total + Number(buffer),
     estimate = Math.ceil(generated * 15);
@@ -98,10 +99,15 @@ export default function SceneMusic({ episode, scene, dirty, busy, onReload }) {
             ...extra
           }
         });
+        if (action === 'music-plan')
+          await request('/studio/assistant/music/generate', {
+            method: 'POST',
+            body: { episodeId: episode._id, sceneId: scene.id, requestId: crypto.randomUUID() }
+          });
         setNotice(
           action === 'music-plan'
-            ? 'Music brief approved. One audition is queued automatically; progress appears below.'
-            : 'Music take approved for the CapCut package.'
+            ? 'Music brief approved. Your Generate button requested one audition; progress appears below.'
+            : 'Music take approved. Download it separately for this section.'
         );
       } else if (action === 'generate') {
         await request('/studio/assistant/music/generate', {
@@ -143,10 +149,11 @@ export default function SceneMusic({ episode, scene, dirty, busy, onReload }) {
       }}
     >
       <Stack spacing={2}>
-        <Typography variant="h3">Background music for CapCut</Typography>
+        <Typography variant="h3">Background music for this section</Typography>
         <Typography>
-          Generate a separate instrumental track here. Your video sound effects and dialogue stay in
-          their original soundtracks. Music is reviewed separately and included in the export.
+          {complete
+            ? 'Background music is complete. Download your approved track below.'
+            : 'Generate a separate instrumental track for this section. Download it separately from the approved videos, which keep their dialogue and sound effects.'}
         </Typography>
         {error && <Alert severity="error">{error}</Alert>}
         {notice && (
@@ -158,11 +165,17 @@ export default function SceneMusic({ episode, scene, dirty, busy, onReload }) {
           <CircularProgress size={24} />
         ) : (
           <>
-            <Alert severity="info">
-              Scene: {total} seconds. Generate: {generated} seconds ({buffer}-second allowance,
-              maximum 5). One audio file per request. Estimated {estimate} credits at your reported
-              900 credits/minute; API billing may differ. Actual cost is shown when ElevenLabs
-              returns it. No automatic paid retries.
+            <Alert severity={complete ? 'success' : 'info'}>
+              {complete ? (
+                `Approved music covers this ${total}-second scene. No new generation is needed.`
+              ) : (
+                <>
+                  Scene: {total} seconds. Generate: {generated} seconds ({buffer}-second allowance,
+                  maximum 5). One audio file per request. Estimated {estimate} credits at your
+                  reported 900 credits/minute; API billing may differ. Actual cost is shown when
+                  ElevenLabs returns it. No automatic paid retries.
+                </>
+              )}
             </Alert>
             <TextField
               label="Complete background music prompt"
@@ -194,7 +207,7 @@ export default function SceneMusic({ episode, scene, dirty, busy, onReload }) {
               >
                 {data.cue ? 'Save music brief' : 'Prepare music brief'}
               </Button>
-              {data.cue?.enabled && (
+              {data.cue?.enabled && !complete && (
                 <Button
                   variant="contained"
                   disabled={
@@ -207,7 +220,7 @@ export default function SceneMusic({ episode, scene, dirty, busy, onReload }) {
                   }
                   onClick={() => run('music-plan')}
                 >
-                  Approve brief &amp; generate one cue
+                  Generate music
                 </Button>
               )}
               {data.cue?.enabled && data.planReview.status === 'approved' && (
@@ -252,9 +265,8 @@ export default function SceneMusic({ episode, scene, dirty, busy, onReload }) {
               ?.filter((a) => a.status === 'failed')
               .map((a) => (
                 <Alert key={a._id} severity="error">
-                  Automatic music submission failed: {a.error}. Your brief approval is saved.
-                  Resolve the issue, then use Generate another audition; no paid retry runs
-                  automatically.
+                  Music submission failed: {a.error}. Your brief approval is saved. Resolve the
+                  issue, then use Generate another audition; no paid retry runs automatically.
                 </Alert>
               ))}
             {data.jobs.map((job) => (
@@ -327,12 +339,24 @@ export default function SceneMusic({ episode, scene, dirty, busy, onReload }) {
                       >
                         Approve this music take
                       </Button>
-                      <Button component="a" href={mediaUrl(mid) + '?download=1'}>
+                      <Button
+                        component="a"
+                        href={mediaDownloadUrl(mid)}
+                        download
+                        target="_blank"
+                        rel="noopener"
+                      >
                         {option.qc.passed
                           ? 'Download scene-length audio'
                           : 'Download available audio'}
                       </Button>
-                      <Button component="a" href={mediaUrl(option.sourceMediaId) + '?download=1'}>
+                      <Button
+                        component="a"
+                        href={mediaDownloadUrl(option.sourceMediaId)}
+                        download
+                        target="_blank"
+                        rel="noopener"
+                      >
                         Download original
                       </Button>
                       <Button

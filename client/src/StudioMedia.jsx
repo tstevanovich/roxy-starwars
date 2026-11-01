@@ -306,6 +306,9 @@ export default function MediaLibrary({ media, onMedia, onRejected }) {
                 <Button
                   component="a"
                   href={`${mediaUrl(file._id)}${mediaUrl(file._id).includes('?') ? '&' : '?'}download=1`}
+                  download={file.originalName}
+                  target="_blank"
+                  rel="noopener"
                   size="small"
                 >
                   Download original

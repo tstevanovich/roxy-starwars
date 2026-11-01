@@ -3,7 +3,14 @@ import { useEffect, useRef, useState } from 'react';
 
 import { mediaUrl } from './studio-utils.js';
 import { ReferencePreview } from './StudioMedia.jsx';
-export default function AnimaticPreview({ scene, episodeId, assets, media, playable = true }) {
+export default function AnimaticPreview({
+  scene,
+  episodeId,
+  assets,
+  media,
+  playable = true,
+  showShotList = true
+}) {
   const [playing, setPlaying] = useState(false),
     [elapsed, setElapsed] = useState(0),
     [error, setError] = useState('');
@@ -114,23 +121,25 @@ export default function AnimaticPreview({ scene, episodeId, assets, media, playa
           </Stack>
         </>
       )}
-      <Box
-        sx={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 230px), 1fr))',
-          gap: 2
-        }}
-      >
-        {shots.map(({ clip, image }) => (
-          <Box key={clip.id}>
-            <ReferencePreview file={media.find((m) => m._id === image)} compact />
-            <Typography>
-              {clip.title} · {clip.duration}s
-            </Typography>
-            <Typography variant="body2">{clip.camera}</Typography>
-          </Box>
-        ))}
-      </Box>
+      {showShotList && (
+        <Box
+          sx={{
+            display: 'grid',
+            gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 230px), 1fr))',
+            gap: 2
+          }}
+        >
+          {shots.map(({ clip, image }) => (
+            <Box key={clip.id}>
+              <ReferencePreview file={media.find((m) => m._id === image)} compact />
+              <Typography>
+                {clip.title} · {clip.duration}s
+              </Typography>
+              <Typography variant="body2">{clip.camera}</Typography>
+            </Box>
+          ))}
+        </Box>
+      )}
     </Stack>
   );
 }

@@ -8,6 +8,76 @@ import SceneMusic from './SceneMusic.jsx';
 import { theme } from './theme.js';
 
 vi.mock('./api.js', () => ({ request: vi.fn() }));
+test('completed music shows the approved track status without asking to approve generation again', async () => {
+  vi.mocked(request).mockResolvedValue({
+    cue: { enabled: true, prompt: 'Saved music', bufferSeconds: 5, candidates: [] },
+    defaults: { prompt: 'Saved music' },
+    targetSeconds: 37,
+    planReview: { status: 'approved', blockers: [] },
+    takeReview: { status: 'approved', blockers: [] },
+    jobs: []
+  });
+  render(
+    <ThemeProvider theme={theme}>
+      <SceneMusic
+        episode={{ _id: 'episode' }}
+        scene={{ id: 'arrival' }}
+        dirty={false}
+        busy={false}
+      />
+    </ThemeProvider>
+  );
+  expect(
+    await screen.findByText(
+      'Approved music covers this 37-second scene. No new generation is needed.'
+    )
+  ).toBeVisible();
+  expect(screen.queryByRole('button', { name: 'Generate music' })).not.toBeInTheDocument();
+});
+test('music downloads preserve both the active project and attachment query', async () => {
+  window.history.replaceState({}, '', '/?project=old-republic-sith-inquisitor');
+  vi.mocked(request).mockResolvedValue({
+    cue: {
+      enabled: true,
+      prompt: 'Saved cue',
+      bufferSeconds: 5,
+      selectedMediaId: 'music',
+      candidates: [
+        {
+          id: 'choice',
+          mediaIds: ['music'],
+          sourceMediaId: 'original',
+          fingerprint: 'current',
+          qc: { passed: true, preparedSeconds: 37, leadingSeconds: 0, trailingSeconds: 0 }
+        }
+      ]
+    },
+    defaults: { prompt: 'Saved cue' },
+    targetSeconds: 37,
+    fingerprint: 'current',
+    planReview: { status: 'approved', blockers: [] },
+    takeReview: { status: 'approved', blockers: [] },
+    jobs: []
+  });
+  try {
+    render(
+      <ThemeProvider theme={theme}>
+        <SceneMusic
+          episode={{ _id: 'episode' }}
+          scene={{ id: 'scene' }}
+          dirty={false}
+          busy={false}
+        />
+      </ThemeProvider>
+    );
+    const link = await screen.findByRole('link', { name: 'Download scene-length audio' });
+    const url = new URL(link.href);
+    expect(url.searchParams.get('project')).toBe('old-republic-sith-inquisitor');
+    expect(url.searchParams.get('download')).toBe('1');
+  } finally {
+    window.history.replaceState({}, '', '/');
+  }
+});
 test('shows complete prompt, bounded duration and one-output estimate; approval uses the saved workflow gate', async () => {
   const target = { scope: 'scene', recordId: 'episode', sceneId: 'arrival' };
   const prompt =
@@ -48,7 +118,7 @@ test('shows complete prompt, bounded duration and one-output estimate; approval 
   expect(screen.getByText(/Scene: 37 seconds. Generate: 42 seconds/)).toHaveTextContent(
     '630 credits'
   );
-  await user.click(screen.getByRole('button', { name: 'Approve brief & generate one cue' }));
+  await user.click(screen.getByRole('button', { name: 'Generate music' }));
   await waitFor(() =>
     expect(request).toHaveBeenCalledWith(
       '/studio/workflow/review',
@@ -61,7 +131,5 @@ test('shows complete prompt, bounded duration and one-output estimate; approval 
       })
     )
   );
-  expect(vi.mocked(request).mock.calls.some(([url]) => url.endsWith('/music/generate'))).toBe(
-    false
-  );
+  expect(vi.mocked(request).mock.calls.some(([url]) => url.endsWith('/music/generate'))).toBe(true);
 });

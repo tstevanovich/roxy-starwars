@@ -26,9 +26,12 @@ test('video dialogue gets pronunciation direction without renaming references or
     { _id: 'al', name: 'AL-1B', kind: 'droid', brief: 'Copilot.', characterSheets: [] }
   ];
   const prompt = clipPrompts(scene, clip, assets);
-  assert.match(prompt.video, /DIALOGUE: ROXY: Al, seal the hatch\.\nAL: Already done\./);
+  assert.match(
+    prompt.video,
+    /DIALOGUE: ROXY says: "Al, seal the hatch\."\nAL says: "Already done\."/
+  );
   assert.match(prompt.video, /one syllable, rhyming with "pal"/);
-  assert.match(prompt.image, /REFERENCES: AL-1B:/);
+  assert.match(prompt.video, /REFERENCES: AL-1B:/);
   assert.doesNotMatch(prompt.image, /PRONUNCIATION/);
   assert.equal(clip.dialogue, dialogue);
   assert.equal(scene.script, 'Roxy calls AL from the cockpit.');

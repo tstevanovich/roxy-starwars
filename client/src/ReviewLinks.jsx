@@ -9,7 +9,7 @@ export default function ReviewLinks({ rows = [], currentId, prefix = 'Go to' }) 
         <Button
           component="a"
           key={row.key}
-          href={reviewHref(row.target, row.stage, currentId)}
+          href={row.navigationHref || reviewHref(row.target, row.stage, currentId)}
           size="small"
         >
           {prefix} {row.navigationTitle || row.title}

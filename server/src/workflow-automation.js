@@ -5,14 +5,19 @@ import { characterPackageLayout } from '../../shared/character-package.js';
 import { proposalApplication } from '../../shared/production-proposals.js';
 import { musicModel, musicPrompt } from '../../shared/scene-music.js';
 import { shotContinuity } from '../../shared/shot-continuity.js';
+import { prepareAnimaticTiming } from './animatic-timing.js';
+import { sceneApprovalBindings } from './approval-recovery.js';
+import { dialogueCast, dialogueTurns, speakerAsset, speakerKey } from './assistant/dialogue.js';
 import { Job, Proposal, Run } from './assistant/models.js';
+import { currentVoiceAuditions, voiceDirection } from './assistant/voice-production.js';
 import {
   StudioAsset,
   StudioAutomation,
   StudioEpisode,
   StudioMedia,
   StudioMusicCue,
-  StudioProject
+  StudioProject,
+  StudioReview
 } from './models/Studio.js';
 import { musicState } from './music-state.js';
 import { workflowContext, workflowEnabled } from './production-workflow.js';
@@ -28,6 +33,12 @@ const equalTarget = (a, b) =>
     (field) => (a?.[field] ?? '') === (b?.[field] ?? '')
   );
 export function workflowAssetStatus(asset, context) {
+  if (asset.kind === 'voice') {
+    if (asset.finalChoice?.voiceId && asset.reviewStatus !== 'pending-choice') return 'finalized';
+    if (asset.candidates?.some((candidate) => !candidate.archived && candidate.mediaIds?.length))
+      return 'pending-choice';
+    return asset.finalChoice?.voiceId ? 'finalized' : 'development';
+  }
   const target = { scope: 'asset', recordId: String(asset._id) };
   const rows = [
     'source',
@@ -50,11 +61,21 @@ export function workflowAssetStatus(asset, context) {
 }
 
 // These are only mechanical steps. The planner never approves a result or writes a story decision.
-export function createWorkflowAutomation(production, { queueStory } = {}) {
-  async function plan(target, { retryFailed = false } = {}) {
+export function createWorkflowAutomation(
+  production,
+  { queueStory, mediaDirectory, automaticMediaGeneration = false } = {}
+) {
+  async function plan(target, { retryFailed = false, includeBlocked = false } = {}) {
     if (!workflowEnabled()) return [];
     const context = await workflowContext();
     const { parent, scene, clip } = context.locate(target);
+    if (target.scope === 'asset' && parent.archived) return [];
+    if (
+      ['scene', 'clip'].includes(target.scope) &&
+      context.evaluate({ scope: 'episode', recordId: String(parent._id) }, 'outline').status !==
+        'approved'
+    )
+      return [];
     let pendingVideoRevisions = [];
     if (target.scope !== 'asset') {
       const drafts = await Proposal.find({
@@ -76,6 +97,36 @@ export function createWorkflowAutomation(production, { queueStory } = {}) {
     }
     const requests = [];
     const approved = (stage) => context.evaluate(target, stage).status === 'approved';
+    if (
+      target.scope === 'asset' &&
+      !parent.brief?.trim() &&
+      !parent.archived &&
+      !parent.clipId &&
+      !['voice', 'sound'].includes(parent.kind) &&
+      !retryFailed
+    ) {
+      if (await Proposal.exists({ assetId: String(parent._id), status: 'pending' })) return [];
+      const kind = 'story-asset-brief';
+      const fingerprint = context.evaluate(target, 'brief').fingerprint;
+      const requestId =
+        'workflow-story-' +
+        digest({ project: projectKey(), target, kind, fingerprint, revision: parent.revision });
+      if (await Run.exists({ workflowKey: requestId })) return [];
+      return [
+        {
+          kind,
+          requestId,
+          target: { assetId: String(parent._id) },
+          draft: {
+            kind,
+            stage: 'brief',
+            fingerprint,
+            assetId: String(parent._id),
+            revision: parent.revision
+          }
+        }
+      ];
+    }
     if (target.scope === 'episode' && !retryFailed) {
       const stage = approved('outline') ? 'outline' : approved('source') ? 'source' : null;
       const kind =
@@ -90,7 +141,10 @@ export function createWorkflowAutomation(production, { queueStory } = {}) {
         const steps = (
           await Promise.all(
             parent.scenes.map((s) =>
-              plan({ scope: 'scene', recordId: String(parent._id), sceneId: s.id })
+              plan(
+                { scope: 'scene', recordId: String(parent._id), sceneId: s.id },
+                { includeBlocked }
+              )
             )
           )
         ).flat();
@@ -264,8 +318,34 @@ export function createWorkflowAutomation(production, { queueStory } = {}) {
             '',
             clip.production?.referenceMediaIds ?? []
           );
-        if (clip.dialogue?.trim() && !clip.selectedDialogueId && !clip.dialogueTakeIds?.length)
+        if (clip.dialogue?.trim() && !clip.selectedDialogueId && !clip.dialogueTakeIds?.length) {
           add('dialogue', renderTarget, ['script', 'shot-plan']);
+          if (!retryFailed) {
+            let turns = [];
+            try {
+              turns = dialogueTurns(clip.dialogue);
+            } catch (e) {
+              if (!e.status) throw e;
+            }
+            for (const { speaker } of turns) {
+              const voice = speakerAsset(speaker, context.assets);
+              if (
+                voice?.finalChoice?.voiceId ||
+                currentVoiceAuditions(voice, voiceDirection(speaker, context.assets)).length
+              )
+                continue;
+              const requestId =
+                'workflow-voice-' +
+                digest({
+                  project: projectKey(),
+                  speaker: speakerKey(speaker),
+                  description: voiceDirection(speaker, context.assets)
+                });
+              if (!requests.some((request) => request.requestId === requestId))
+                requests.push({ kind: 'voice', target: renderTarget, speaker, requestId });
+            }
+          }
+        }
       }
     }
     if (target.scope === 'scene' && approved('music-plan')) {
@@ -372,9 +452,11 @@ export function createWorkflowAutomation(production, { queueStory } = {}) {
     }
     const jobs = await Job.find()
       .sort({ createdAt: -1, _id: -1 })
-      .select('requestId kind target status historyId snapshot.fingerprint')
+      .select('requestId kind target status historyId error snapshot.fingerprint')
       .lean();
     return requests.flatMap((r) => {
+      if (!automaticMediaGeneration && !r.kind.startsWith('story-')) return [];
+      if (['image', 'video'].includes(r.kind) && scene?.production?.manualGeneration) return [];
       const matching = jobs.filter((j) => j.kind === r.kind && equalTarget(j.target, r.target));
       if (
         r.kind === 'music' &&
@@ -402,7 +484,47 @@ export function createWorkflowAutomation(production, { queueStory } = {}) {
           }
         ];
       }
-      return jobs.some((j) => j.requestId === r.requestId) ? [] : [r];
+      if (jobs.some((j) => j.requestId === r.requestId)) {
+        const failed = matching[0];
+        if (
+          r.kind === 'image' &&
+          failed?.status === 'failed' &&
+          !failed.historyId &&
+          failed.error === 'Too many image references; select fewer references for this request.'
+        ) {
+          const requestId =
+            'workflow-reference-budget-' +
+            digest({ base: r.requestId, failed: String(failed._id) });
+          return jobs.some((j) => j.requestId === requestId)
+            ? []
+            : [{ ...r, requestId, retryOf: String(failed._id) }];
+        }
+        return [];
+      }
+      if (r.kind === 'dialogue') {
+        try {
+          dialogueCast(
+            scene.clips.find((c) => c.id === r.target.clipId),
+            context.assets
+          );
+        } catch (e) {
+          if (!e.status) throw e;
+          const voice = context.assets.find(
+            (asset) =>
+              asset.kind === 'voice' &&
+              !asset.finalChoice &&
+              !asset.archived &&
+              scene.clips
+                .find((c) => c.id === r.target.clipId)
+                ?.dialogue?.toLowerCase()
+                .includes((asset.aliases?.[0] || asset.name).toLowerCase())
+          );
+          return includeBlocked
+            ? [{ ...r, error: e.message, voiceAssetId: voice ? String(voice._id) : undefined }]
+            : [];
+        }
+      }
+      return [r];
     });
   }
   async function progress(target) {
@@ -410,9 +532,9 @@ export function createWorkflowAutomation(production, { queueStory } = {}) {
     const nextSteps = await plan(target);
     const context = await workflowContext();
     const { parent } = context.locate(target);
-    if (['episode', 'scene'].includes(target.scope)) {
+    if (['asset', 'episode', 'scene'].includes(target.scope)) {
       const proposals = await Proposal.find({
-        episodeId: String(parent._id),
+        [target.scope === 'asset' ? 'assetId' : 'episodeId']: String(parent._id),
         status: 'pending',
         ...(target.sceneId
           ? {
@@ -439,7 +561,9 @@ export function createWorkflowAutomation(production, { queueStory } = {}) {
             : `Draft ready for your review: ${proposal.title}. Review and apply the proposed revision on this board or in production chat, then approve its saved stage.`
         };
       const runs = await Run.find({
-        'workflowDraft.episodeId': String(parent._id),
+        [target.scope === 'asset' ? 'workflowDraft.assetId' : 'workflowDraft.episodeId']: String(
+          parent._id
+        ),
         'workflowDraft.revision': parent.revision,
         ...(target.sceneId ? { 'workflowDraft.sceneId': target.sceneId } : {})
       })
@@ -459,9 +583,11 @@ export function createWorkflowAutomation(production, { queueStory } = {}) {
               ? `Story drafting needs attention: ${run.error}`
               : run.status === 'completed'
                 ? 'Review the story assistant response in production chat before continuing.'
-                : run.workflowDraft.kind === 'story-scene-plan'
-                  ? 'The shot and sound plans are being prepared from your approved script and designs through your ChatGPT plan. The draft will appear here for review. Your existing approvals remain saved.'
-                  : 'The next story draft is queued or being written through your ChatGPT plan. It will wait for your review; no media generation has started.'
+                : run.workflowDraft.kind === 'story-asset-brief'
+                  ? 'The Creative brief is being prepared from saved source evidence and character details through your ChatGPT plan. The draft will appear here for review.'
+                  : run.workflowDraft.kind === 'story-scene-plan'
+                    ? 'The shot and sound plans are being prepared from your approved script and designs through your ChatGPT plan. The draft will appear here for review. Your existing approvals remain saved.'
+                    : 'The next story draft is queued or being written through your ChatGPT plan. It will wait for your review; no media generation has started.'
         };
       }
     }
@@ -525,7 +651,10 @@ export function createWorkflowAutomation(production, { queueStory } = {}) {
         nextSteps,
         message: jobs.some((j) => j.status === 'uncertain')
           ? 'A submission has an unknown outcome. Your approvals are saved. Check its OpenArt history before requesting a replacement.'
-          : 'A production job failed. Your approvals are saved. Review its job details before requesting a replacement.'
+          : 'A production job failed. Your approvals are saved. Review its job details before requesting a replacement.' +
+            (nextSteps.length
+              ? ` ${nextSteps.length} other ready request${nextSteps.length === 1 ? ' can' : 's can'} still be started below.`
+              : '')
       };
     if (nextSteps.length)
       return {
@@ -582,8 +711,6 @@ export function createWorkflowAutomation(production, { queueStory } = {}) {
             stage
           )
         );
-    if (target.scope === 'episode' && rows.every((r) => r.status === 'approved'))
-      rows.push(context.evaluate(target, 'export'));
     const first = rows.find((r) => r.status !== 'approved');
     if (['episode', 'scene'].includes(target.scope) && first)
       return {
@@ -638,7 +765,7 @@ export function createWorkflowAutomation(production, { queueStory } = {}) {
           state: 'review',
           retrySteps,
           nextSteps,
-          message: `${waitingPictures.length} video clip${waitingPictures.length === 1 ? ' is' : 's are'} waiting for picture and performance review. Players and rejection controls are at the top of this episode. Choose a picture take in its clip and approve it on this board before the next automatic video is submitted.`
+          message: `${waitingPictures.length} video clip${waitingPictures.length === 1 ? ' is' : 's are'} waiting for picture and performance review in their shot cards. You can work on other shots independently.`
         };
     }
     return {
@@ -680,38 +807,55 @@ export function createWorkflowAutomation(production, { queueStory } = {}) {
               'The approved inputs changed. Review the current version before starting production.'
             );
         }
+        const failures = [];
         for (const item of await plan(action.target, {
           retryFailed: action.trigger.retryFailed === true
         })) {
-          if (item.kind.startsWith('story-')) {
-            if (!queueStory)
-              fail('Story drafting is unavailable. Open production chat to continue.');
-            await queueStory(item);
-            continue;
-          }
-          let job;
           try {
-            job =
-              item.kind === 'music'
-                ? (await production.music.queue(item.args)).job
-                : item.kind === 'mix'
-                  ? (await production.sound.queueMix({ ...item.args, requestId: item.requestId }))
-                      .job
-                  : await production.queue(item);
+            if (item.kind.startsWith('story-')) {
+              if (!queueStory)
+                fail('Story drafting is unavailable. Open production chat to continue.');
+              await queueStory(item);
+              continue;
+            }
+            let job;
+            try {
+              job =
+                item.kind === 'music'
+                  ? (await production.music.queue(item.args)).job
+                  : item.kind === 'mix'
+                    ? (await production.sound.queueMix({ ...item.args, requestId: item.requestId }))
+                        .job
+                    : await production.queue(item);
+            } catch (e) {
+              if (e.code !== 11000) throw e;
+              job = await Job.findOne({ requestId: item.requestId }).lean();
+              if (!job) throw e;
+            }
+            if (!job) continue;
+            await StudioAutomation.updateOne(
+              { _id: action._id },
+              { $addToSet: { jobIds: String(job._id) } }
+            );
           } catch (e) {
-            if (e.code !== 11000) throw e;
-            job = await Job.findOne({ requestId: item.requestId }).lean();
-            if (!job) throw e;
+            failures.push({
+              kind: item.kind,
+              target: item.target,
+              error: e.status
+                ? e.message
+                : 'This request could not be queued. Check connections and try again.'
+            });
           }
-          if (!job) continue;
-          await StudioAutomation.updateOne(
-            { _id: action._id },
-            { $addToSet: { jobIds: String(job._id) } }
-          );
         }
         await StudioAutomation.updateOne(
           { _id: action._id },
-          { $set: { status: 'complete', error: '' } }
+          {
+            $set: {
+              status: failures.length ? 'failed' : 'complete',
+              error: failures.map((f) => f.error).join(' '),
+              failures
+            }
+          }
         );
         await StudioAutomation.updateMany(
           {
@@ -777,6 +921,19 @@ export function createWorkflowAutomation(production, { queueStory } = {}) {
         for (const scene of episode.scenes)
           if (
             scene.assetIds.map(String).includes(target.recordId) ||
+            (context.assets.find((a) => String(a._id) === target.recordId)?.kind === 'voice' &&
+              scene.clips.some((clip) => {
+                if (!clip.dialogue?.trim()) return false;
+                try {
+                  return dialogueTurns(clip.dialogue).some(
+                    ({ speaker }) =>
+                      String(speakerAsset(speaker, context.assets)?._id) === target.recordId
+                  );
+                } catch (e) {
+                  if (!e.status) throw e;
+                  return false;
+                }
+              })) ||
             (image && String(image.episodeId) === String(episode._id))
           )
             targets.push({ scope: 'scene', recordId: String(episode._id), sceneId: scene.id });
@@ -805,7 +962,98 @@ export function createWorkflowAutomation(production, { queueStory } = {}) {
           }
       });
   }
-  return { plan, progress, schedule, afterApproval, processNext, reconcilePlanning };
+  async function reconcileProduction() {
+    for (const project of await StudioProject.find({ workflowVersion: 1 }).lean())
+      await withProject(project.key, async () => {
+        for (const asset of await StudioAsset.find({
+          brief: { $in: ['', null] },
+          archived: { $ne: true },
+          kind: { $nin: ['voice', 'sound'] }
+        }).lean()) {
+          const target = { scope: 'asset', recordId: String(asset._id) };
+          const steps = await plan(target);
+          if (steps.some((step) => step.kind === 'story-asset-brief'))
+            await schedule(target, { briefPreparation: steps[0].requestId });
+        }
+        for (const episode of await StudioEpisode.find().lean()) {
+          if (mediaDirectory)
+            for (const scene of episode.scenes) {
+              const clipIds = scene.clips
+                .filter(
+                  (clip) =>
+                    clip.selectedDialogueId &&
+                    !clip.selectedTakeId &&
+                    !clip.production?.visualTakeId
+                )
+                .map((clip) => clip.id);
+              if (clipIds.length)
+                await prepareAnimaticTiming({
+                  episodeId: String(episode._id),
+                  sceneId: scene.id,
+                  clipIds,
+                  mediaDirectory
+                });
+            }
+          const target = { scope: 'episode', recordId: String(episode._id) };
+          const steps = await plan(target);
+          if (steps.length)
+            await schedule(target, {
+              productionRecovery: steps.map((step) => step.requestId).sort()
+            });
+        }
+      });
+  }
+  async function reconcileSceneApprovals() {
+    for (const project of await StudioProject.find({ workflowVersion: 1 }).lean())
+      await withProject(project.key, async () => {
+        const [assets, episodes, media, reviews, musicCues] = await Promise.all([
+          StudioAsset.find().lean(),
+          StudioEpisode.find().lean(),
+          StudioMedia.find().lean(),
+          StudioReview.find().lean(),
+          StudioMusicCue.find().lean()
+        ]);
+        const recovery = sceneApprovalBindings({ assets, episodes, media, reviews, musicCues });
+        for (const binding of recovery.bindings)
+          await StudioReview.updateOne(
+            {
+              _id: binding.id,
+              revision: binding.revision,
+              fingerprint: binding.fingerprint,
+              state: 'approved',
+              approvalFingerprint:
+                binding.stage === 'sound-plan' ? { $ne: binding.approvalFingerprint } : null
+            },
+            {
+              $set: {
+                approvalFingerprint: binding.approvalFingerprint,
+                contentFingerprint: binding.approvalFingerprint
+              }
+            }
+          );
+        for (const binding of recovery.feedbackBindings)
+          await StudioReview.updateOne(
+            {
+              _id: binding.id,
+              revision: binding.revision,
+              fingerprint: binding.fingerprint,
+              state: 'changes-requested',
+              contentFingerprint: null
+            },
+            { $set: { contentFingerprint: binding.approvalFingerprint } }
+          );
+      });
+  }
+  return {
+    plan,
+    progress,
+    schedule,
+    afterApproval,
+    processNext,
+    reconcilePlanning,
+    reconcileProduction,
+    reconcileSceneApprovals
+  };
 }
 
 export async function finalizeReviewedPackage(target) {

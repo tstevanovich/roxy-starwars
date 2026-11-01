@@ -16,10 +16,18 @@ import { request } from './api.js';
 import RejectMediaButton from './RejectMediaButton.jsx';
 import { ReferencePreview } from './StudioMedia.jsx';
 
-export default function ShotImageReview({ asset, media, onSaved, onRejected, onBack, onChat }) {
+export default function ShotImageReview({
+  asset,
+  media,
+  onSaved,
+  onRejected,
+  onBack,
+  onChat,
+  disabled = false
+}) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const choices = asset.candidates.filter((candidate) => !candidate.archived);
+  const choices = (asset.candidates ?? []).filter((candidate) => !candidate.archived);
   async function approve(candidateId, reopen = false) {
     setBusy(true);
     setError('');
@@ -138,20 +146,22 @@ export default function ShotImageReview({ asset, media, onSaved, onRejected, onB
               <Stack direction="row" sx={{ gap: 2, flexWrap: 'wrap' }}>
                 <Button
                   variant="contained"
-                  disabled={busy || approved || !file || candidate.mediaIds.length !== 1}
+                  disabled={
+                    disabled || busy || approved || !file || candidate.mediaIds.length !== 1
+                  }
                   onClick={() => approve(candidate.id)}
                 >
                   {approved ? 'Image approved' : 'Approve image'}
                 </Button>
                 {approved && (
-                  <Button disabled={busy} onClick={() => approve(candidate.id, true)}>
+                  <Button disabled={disabled || busy} onClick={() => approve(candidate.id, true)}>
                     Un-finalize
                   </Button>
                 )}
                 {file && (
                   <RejectMediaButton
                     file={file}
-                    disabled={busy}
+                    disabled={disabled || busy}
                     context={{
                       assetId: asset._id,
                       revision: asset.revision,

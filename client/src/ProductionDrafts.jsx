@@ -33,6 +33,7 @@ export function DraftSupportingNotes({ notes = [] }) {
 }
 export function ProposalContent({ proposal, record }) {
   const fields = [
+    ['voiceDescription', 'Proposed voice directions'],
     ['sourceNotes', 'Proposed source research'],
     ['outline', 'Proposed episode outline']
   ].filter(
@@ -43,6 +44,23 @@ export function ProposalContent({ proposal, record }) {
   return (
     <Stack spacing={2}>
       <DraftSupportingNotes notes={proposal.supportingNotes} />
+      {proposal.brief !== undefined && (
+        <Box>
+          <Typography variant="h3">Proposed Creative brief</Typography>
+          <Typography sx={{ whiteSpace: 'pre-wrap' }}>{proposal.brief}</Typography>
+          <Alert severity="info" sx={{ mt: 1 }}>
+            Applying this draft fills the Creative brief field. Review the saved source and brief
+            before image generation starts.
+          </Alert>
+        </Box>
+      )}
+      {record?.kind === 'voice' && proposal.production?.voiceDescription && (
+        <Alert severity="info">
+          Applying these voice directions saves the prompt. Review it, then use Generate voice
+          auditions in the shot's dialogue section. Earlier auditions remain in history, and each
+          new audition needs your listening review.
+        </Alert>
+      )}
       {proposal.sourceReferences && (
         <Box>
           <Typography variant="h3">Proposed source ranges</Typography>
@@ -72,8 +90,9 @@ export function ProposalContent({ proposal, record }) {
               'Use the saved approved shot directions without additional changes.'}
           </Typography>
           <Alert severity="info" sx={{ mt: 1 }}>
-            Uses this clip's approved shot image and dialogue. Correct and approve those first if
-            needed.{' '}
+            Dialogue uses a voice reference, which does not guarantee synchronization to the saved
+            recording. That mode also treats the image as a composition reference rather than a
+            locked starting frame. Multiple speaking characters are allowed in the same shot.{' '}
             {proposal.status === 'applied'
               ? 'The approved request is saved. Follow its job status below; the resulting video still needs your review.'
               : 'This request has not generated a video. Approval below queues one render; its result still needs your review.'}
@@ -122,6 +141,15 @@ export function ProposalContent({ proposal, record }) {
                 {clip.title} · {clip.duration}s
               </Typography>
               <Typography>{clip.dialogue || clip.action}</Typography>
+              {clip.production?.imagePrompt &&
+                (!proposal.targetClipId || proposal.targetClipId === clip.id) && (
+                  <Box sx={{ mt: 1 }}>
+                    <Typography fontWeight={600}>Exact image prompt sent to OpenArt</Typography>
+                    <Typography sx={{ whiteSpace: 'pre-wrap' }}>
+                      {clip.production.imagePrompt}
+                    </Typography>
+                  </Box>
+                )}
               {clip.production?.location && (
                 <Typography>
                   Shot location: {clip.production.location} · {clip.production.environment}
@@ -133,6 +161,15 @@ export function ProposalContent({ proposal, record }) {
               <Typography>{clip.production?.framing}</Typography>
               <Typography>{clip.production?.beats}</Typography>
               <Typography>{clip.production?.passCondition}</Typography>
+              {clip.production?.startState && (
+                <Typography>Start: {clip.production.startState}</Typography>
+              )}
+              {clip.production?.allowedMotion && (
+                <Typography>Movement: {clip.production.allowedMotion}</Typography>
+              )}
+              {clip.production?.endState && (
+                <Typography>End at cut: {clip.production.endState}</Typography>
+              )}
             </Box>
           ))}
           {proposal.scene.soundPlan && (
@@ -261,7 +298,9 @@ export default function ProductionDrafts({ proposals, record, disabled, onChange
                     ? 'Applying draft…'
                     : proposal.render
                       ? 'Approve revision & generate video'
-                      : 'Apply revised draft'}
+                      : record?.kind === 'voice' && proposal.production?.voiceDescription
+                        ? 'Apply voice directions'
+                        : 'Apply revised draft'}
                 </Button>
                 <Button disabled={disabled || !!busy} onClick={() => act(proposal, 'dismiss')}>
                   Dismiss draft

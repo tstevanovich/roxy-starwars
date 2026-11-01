@@ -1,5 +1,5 @@
 import { ThemeProvider } from '@mui/material/styles';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, test, vi } from 'vitest';
 
@@ -37,6 +37,113 @@ beforeEach(() => {
   window.history.replaceState({}, '', '/');
   vi.mocked(request).mockReset();
   vi.mocked(request).mockImplementation(async (url) => (url.endsWith('/board') ? board : {}));
+});
+
+test('the episode board groups each shot under its own scene and links directly to scenes', async () => {
+  const episode = {
+    _id: 'episode',
+    revision: 2,
+    scenes: [
+      {
+        id: 'arrival',
+        title: 'Arrival',
+        clips: [{ id: 'landing', title: 'Landing', duration: 5, dialogue: '', production: {} }]
+      },
+      {
+        id: 'academy',
+        title: 'Academy',
+        clips: [{ id: 'opening', title: 'Opening', duration: 5, dialogue: '', production: {} }]
+      }
+    ]
+  };
+  vi.mocked(request).mockResolvedValue({
+    enabled: true,
+    layout: 'scenes',
+    record: episode,
+    groups: episode.scenes.flatMap((scene) => [
+      {
+        title: scene.title,
+        target: { scope: 'scene', recordId: 'episode', sceneId: scene.id },
+        stages: []
+      },
+      ...scene.clips.map((clip) => ({
+        title: clip.title,
+        target: { scope: 'clip', recordId: 'episode', sceneId: scene.id, clipId: clip.id },
+        stages: []
+      }))
+    ])
+  });
+  render(
+    <ThemeProvider theme={theme}>
+      <ProductionBoard record={episode} scope="episode" onChanged={vi.fn()} />
+    </ThemeProvider>
+  );
+  const first = await screen.findByRole('region', { name: 'Scene 1: Arrival' });
+  const second = screen.getByRole('region', { name: 'Scene 2: Academy' });
+  expect(within(first).getByRole('region', { name: 'Shot 1: Landing' })).toBeVisible();
+  expect(within(second).getByRole('region', { name: 'Shot 1: Opening' })).toBeVisible();
+  expect(within(first).queryByRole('region', { name: 'Shot 1: Opening' })).not.toBeInTheDocument();
+  expect(screen.getByRole('link', { name: 'Scene 2: Academy' })).toHaveAttribute(
+    'href',
+    '#board-scene-academy'
+  );
+  expect(within(second).getByRole('button', { name: 'Generate video' })).toBeDisabled();
+});
+
+test('an over-limit animatic shows measured timing and offers an actual split draft instead of approval', async () => {
+  const target = { scope: 'clip', recordId: 'episode', sceneId: 'scene', clipId: 'shot' };
+  const timingRow = {
+    ...row,
+    key: 'timing',
+    title: 'Timed animatic',
+    stage: 'animatic',
+    target,
+    status: 'draft',
+    canApprove: false,
+    timingIssues: [
+      {
+        clipId: 'shot',
+        message: 'Selected dialogue is 18.88s; the audio-reference limit is 15 seconds.'
+      }
+    ]
+  };
+  const episode = {
+    _id: 'episode',
+    revision: 2,
+    scenes: [
+      {
+        id: 'scene',
+        clips: [{ id: 'shot', title: 'Mandate', duration: 24, dialogue: 'HARKUN: Begin.' }]
+      }
+    ]
+  };
+  vi.mocked(request).mockImplementation(async (url) =>
+    url.endsWith('/animatic/prepare')
+      ? { timingRepair: 'split', message: 'Timing revision draft ready above.' }
+      : {
+          enabled: true,
+          record: episode,
+          groups: [{ title: 'Mandate', target, stages: [timingRow] }]
+        }
+  );
+  const user = userEvent.setup();
+  render(
+    <ThemeProvider theme={theme}>
+      <ProductionBoard record={episode} scope="episode" media={[]} onChanged={vi.fn()} />
+    </ThemeProvider>
+  );
+  expect(await screen.findByRole('button', { name: 'Approve Timed animatic' })).toBeDisabled();
+  expect(screen.getByText(/Selected dialogue is 18.88s/)).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Prepare split or retimed shots' }));
+  expect(request).toHaveBeenCalledWith('/studio/workflow/animatic/prepare', {
+    method: 'POST',
+    body: { target, parentRevision: 2 }
+  });
+  expect(await screen.findByText('Timing revision draft ready above.')).toBeVisible();
+  expect(screen.getByRole('link', { name: 'Go to timing draft' })).toHaveAttribute(
+    'href',
+    '#production-revisions'
+  );
 });
 
 test('a provider failure is shown at the missing reference instead of an unexplained Draft label', async () => {
@@ -451,15 +558,23 @@ test('already-approved inputs can start the next step and queued work is visible
   );
   mount();
   await user.click(
-    await screen.findByRole('button', { name: 'Start next production step (1 jobs)' })
+    await screen.findByRole('button', { name: 'Start next production step (1 request)' })
   );
   expect(request).toHaveBeenCalledWith('/studio/workflow/advance', {
     method: 'POST',
     body: { target: { scope: 'asset', recordId: 'asset-one' }, parentRevision: 2 }
   });
+  expect(await screen.findByRole('status')).toHaveTextContent('Production step queued.');
+  await user.click(screen.getByRole('link', { name: 'Go to production jobs' }));
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Production jobs and retries' })).toHaveAttribute(
+      'aria-expanded',
+      'true'
+    )
+  );
 });
 
-test('queued automation disables duplicate starts and failures distinguish saved approval from generation', async () => {
+test('queued automation disables duplicate starts and replaces the earlier failure notice', async () => {
   vi.mocked(request).mockResolvedValue({
     ...board,
     nextSteps: [{ kind: 'image' }],
@@ -470,12 +585,91 @@ test('queued automation disables duplicate starts and failures distinguish saved
   });
   mount();
   expect(
-    await screen.findByRole('button', { name: 'Start next production step (1 jobs)' })
+    await screen.findByRole('button', { name: 'Start next production step (1 request)' })
   ).toBeDisabled();
-  expect(
-    screen.getByText(/Approval saved. The next step needs attention: Connect OpenArt first/)
-  ).toBeVisible();
+  expect(screen.queryByText(/Connect OpenArt first/)).not.toBeInTheDocument();
   expect(screen.getByText(/Jobs continue when you leave this page/)).toBeVisible();
+});
+
+test('dialogue blockers link to their exact fields and old repeated failures appear once', async () => {
+  const target = { episodeId: 'episode-one', sceneId: 'scene', clipId: 'shot' };
+  const episode = {
+    _id: 'episode-one',
+    revision: 1,
+    scenes: [{ id: 'scene', title: 'Arrival', clips: [{ id: 'shot', title: 'Harkun opening' }] }]
+  };
+  const error = 'Dialogue generation requires one speaker per clip.';
+  vi.mocked(request).mockResolvedValue({
+    enabled: true,
+    groups: [],
+    blockedSteps: [{ kind: 'dialogue', target, error }],
+    automation: [
+      { _id: 'new', status: 'failed', error },
+      { _id: 'old', status: 'failed', error }
+    ],
+    nextSteps: [{ kind: 'image', target }]
+  });
+  mount({ scope: 'episode', record: episode });
+  expect(
+    await screen.findByRole('link', { name: 'Edit dialogue for Harkun opening' })
+  ).toHaveAttribute('href', '#shot-dialogue-shot');
+  expect(screen.getAllByText(/Dialogue generation requires one speaker per clip/)).toHaveLength(1);
+  expect(
+    screen.getByRole('button', { name: 'Start next production step (1 request)' })
+  ).toBeEnabled();
+  expect(screen.getByText('image · Harkun opening')).toBeVisible();
+});
+
+test('failed job shortcuts open and focus the exact job even after recollapsing it', async () => {
+  const user = userEvent.setup();
+  vi.mocked(request).mockResolvedValue({
+    ...board,
+    jobs: [
+      {
+        _id: 'failed-image',
+        kind: 'image',
+        title: 'Image · Harkun opening',
+        status: 'failed',
+        target: { episodeId: record._id, sceneId: 'scene', clipId: 'shot' },
+        error: 'Too many image references.'
+      }
+    ]
+  });
+  mount();
+  const link = await screen.findByRole('link', {
+    name: 'Go to job details for Image · Harkun opening'
+  });
+  expect(link).toHaveAttribute('href', '#production-job-failed-image');
+  const summary = screen.getByRole('button', { name: 'Production jobs and retries' });
+  await user.click(link);
+  await waitFor(() => expect(summary).toHaveAttribute('aria-expanded', 'true'));
+  await waitFor(() =>
+    expect(
+      screen.getByRole('alert', { name: 'Production job: Image · Harkun opening' })
+    ).toHaveFocus()
+  );
+  await user.click(summary);
+  await user.click(link);
+  await waitFor(() => expect(summary).toHaveAttribute('aria-expanded', 'true'));
+});
+
+test('starting production disables repeat clicks while the request is pending', async () => {
+  const user = userEvent.setup();
+  let resolveStart;
+  vi.mocked(request).mockImplementation((url) =>
+    url.endsWith('/board')
+      ? Promise.resolve({ ...board, nextSteps: [{ kind: 'image' }] })
+      : new Promise((resolve) => {
+          resolveStart = resolve;
+        })
+  );
+  mount();
+  await user.click(
+    await screen.findByRole('button', { name: 'Start next production step (1 request)' })
+  );
+  expect(screen.getByRole('button', { name: 'Starting production…' })).toBeDisabled();
+  resolveStart({});
+  expect(await screen.findByRole('status')).toHaveTextContent('Production step queued.');
 });
 
 test('failed prerequisites stay visible after approval and retry starts through the application', async () => {
@@ -583,7 +777,10 @@ test('approved source research stays explicit when the applied outline is ready 
     groups: [{ title: 'Episode preparation', stages: [source, outline] }]
   });
   mount({ scope: 'episode', record: episode });
-  expect(await screen.findByText(/Source research is approved. Remaining outline/)).toBeVisible();
+  expect(await screen.findByRole('link', { name: 'Source research approved' })).toHaveAttribute(
+    'href',
+    '#' + reviewAnchor(source.target, 'source')
+  );
   expect(
     screen.getByRole('button', { name: 'Approve Episode outline', exact: true })
   ).toBeEnabled();

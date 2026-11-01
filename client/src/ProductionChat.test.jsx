@@ -372,3 +372,43 @@ test('OpenArt shows provider-hosted reference delivery and offers a read-only co
     body: {}
   });
 });
+
+test('shot link opens its reusable contextual chat without sending a message or generating media', async () => {
+  window.history.replaceState({}, '', '/?chat=1&episode=episode&scene=academy&shot=opening');
+  const shotContext = { episodeId: 'episode', sceneId: 'academy', clipId: 'opening' };
+  const shotChat = { ...chat, context: shotContext, title: 'Academy / Opening' };
+  detail = { ...detail, chat: shotChat };
+  const original = vi.mocked(request).getMockImplementation();
+  vi.mocked(request).mockImplementation(async (path, options) => {
+    if (path.endsWith('/chats') && options?.method === 'POST') return { chat: shotChat };
+    return original(path, options);
+  });
+  mount({
+    data: {
+      ...data,
+      episodes: [
+        {
+          ...data.episodes[0],
+          scenes: [
+            { id: 'academy', title: 'Academy', clips: [{ id: 'opening', title: 'Opening' }] }
+          ]
+        }
+      ]
+    }
+  });
+  expect(
+    await screen.findByRole('textbox', { name: 'Message your production assistant' })
+  ).toBeVisible();
+  expect(request).toHaveBeenCalledWith('/studio/assistant/chats', {
+    method: 'POST',
+    body: { context: shotContext, reuseShot: true }
+  });
+  expect(screen.getByText(/Discussing: Episode 01 \/ Academy \/ Opening/)).toBeVisible();
+  expect(screen.getByRole('link', { name: 'Back to shot' })).toHaveAttribute(
+    'href',
+    '/?episode=episode#picture-prerequisites-opening'
+  );
+  expect(request.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(1);
+  expect(new URLSearchParams(window.location.search).get('chat')).toBe('chat1');
+  window.history.replaceState({}, '', '/');
+});

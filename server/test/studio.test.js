@@ -883,7 +883,7 @@ test('character sheets preserve the identity and enter prompts and exports only 
   prompt = (await request(app).post('/api/studio/prompts').send(episodeBody(asset._id)).expect(200))
     .body.prompts[0];
   assert.ok(prompt.referenceMediaIds.includes(image._id));
-  assert.match(prompt.image, /Approved character sheet: AL turnaround/);
+  assert.match(prompt.image, /@image\d+:.*AL turnaround/);
   const pending = await upload('pending-sheet.png');
   asset = (
     await request(app)
@@ -974,7 +974,7 @@ test('props support object views and approved sheets become reusable references'
   prompt = (await request(app).post('/api/studio/prompts').send(episodeBody(asset._id)).expect(200))
     .body.prompts[0];
   assert.ok(prompt.referenceMediaIds.includes(image._id));
-  assert.match(prompt.image, /Approved prop sheet: Pistol reference sheet/);
+  assert.match(prompt.image, /@image\d+:.*Pistol reference sheet/);
 });
 
 test('character sheet registration rejects unfinalized identities, non-images and invalid views', async () => {
@@ -1054,7 +1054,7 @@ test('builds different image/video prompts with flexible durations and no music'
   assert.match(prompt.image, /2K/);
   assert.ok(!prompt.image.includes('ROXY:'));
   assert.match(prompt.video, /27 seconds/);
-  assert.match(prompt.video, /ROXY: This should be an easy job/);
+  assert.match(prompt.video, /ROXY says: "This should be an easy job/);
   assert.match(prompt.video, /No music, score, soundtrack, or musical bed/);
 });
 
@@ -1098,4 +1098,41 @@ test('exports a portable ZIP only after approved scenes have selected takes', as
   assert.ok(manifest.media.some((m) => m.id === dialogue._id));
   assert.ok(!manifest.media.some((m) => m.id === alternate._id));
   assert.ok(zip.includes(audio));
+});
+
+test('new workflow characters receive the complete reference package even when only a portrait is supplied', async () => {
+  await StudioProject.updateOne({ key: 'imperial-smuggler' }, { $set: { workflowVersion: 1 } });
+  const portrait = {
+    id: 'master-portrait',
+    title: 'Master portrait',
+    type: 'image',
+    required: true,
+    notes: 'Owner framing.',
+    imagePrompt: 'Exact original portrait directions.',
+    mediaId: null
+  };
+  const response = await request(app)
+    .post('/api/studio/assets')
+    .send({
+      name: 'New workflow character',
+      kind: 'character',
+      brief: 'A new adult character design.',
+      notes: '',
+      scope: 'reusable',
+      production: {
+        sourceMode: 'original',
+        sourceNotes: 'Owner original character design.',
+        items: [portrait]
+      },
+      candidates: []
+    })
+    .expect(201);
+  const created = response.body.asset;
+  assert.equal(created.sheetLayout, 'production-package');
+  assert.equal(created.production.items.length, 9);
+  assert.equal(
+    created.production.items.find((item) => item.id === 'master-portrait').imagePrompt,
+    portrait.imagePrompt
+  );
+  assert.ok(created.production.items.some((item) => item.id === 'body-turnaround'));
 });

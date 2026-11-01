@@ -52,6 +52,7 @@ export const uid = () => crypto.randomUUID();
 export const runtime = (seconds) =>
   `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 export const mediaUrl = (id) => studioUrl(`/api/studio/media/${id}`);
+export const mediaDownloadUrl = (id) => studioUrl(`/api/studio/media/${id}?download=1`);
 export function pendingVideoChoices(episode, media) {
   const videos = new Set(media.filter((file) => file.kind === 'video').map((file) => file._id));
   return (episode.scenes ?? []).flatMap((scene) =>

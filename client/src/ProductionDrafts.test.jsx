@@ -39,6 +39,66 @@ const mount = (props = {}) =>
       <ProductionDrafts proposals={[proposal]} record={record} onChanged={vi.fn()} {...props} />
     </ThemeProvider>
   );
+test('obsolete hold metadata cannot disable video revision approval', () => {
+  mount({
+    record: {
+      ...record,
+      videoGenerationHold: {
+        active: true,
+        reason: 'Video generation is on hold while synchronization is corrected.'
+      }
+    },
+    proposals: [
+      {
+        _id: 'video',
+        baseRevision: 4,
+        title: 'Review video',
+        text: 'No render yet.',
+        status: 'pending',
+        render: {
+          model: 'Wan 3.0 Standard',
+          resolution: '1080p',
+          duration: 5,
+          aspectRatio: '16:9',
+          target: { sceneId: 'scene', clipId: 'shot' }
+        }
+      }
+    ]
+  });
+  expect(screen.getByRole('button', { name: 'Approve revision & generate video' })).toBeEnabled();
+  expect(
+    screen.queryByText(/Video generation is on hold while synchronization/)
+  ).not.toBeInTheDocument();
+  expect(request).not.toHaveBeenCalled();
+});
+test('asset drafts show the full Creative brief and its field application handoff', async () => {
+  const user = userEvent.setup();
+  mount({
+    record: { _id: 'asset', revision: 4, brief: '', production: { items: [] } },
+    proposals: [
+      {
+        _id: 'brief',
+        scope: 'asset',
+        assetId: 'asset',
+        baseRevision: 4,
+        baseBrief: '',
+        baseProduction: { items: [] },
+        production: { items: [] },
+        brief: 'Adult female acolyte in the verified ochre tunic.',
+        title: 'Character brief',
+        text: 'Ready for review'
+      }
+    ]
+  });
+  expect(screen.getByRole('heading', { name: 'Proposed Creative brief' })).toBeVisible();
+  expect(screen.getByText('Adult female acolyte in the verified ochre tunic.')).toBeVisible();
+  expect(screen.getByText(/Applying this draft fills the Creative brief field/)).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Apply revised draft' }));
+  expect(request).toHaveBeenCalledWith(
+    '/studio/assistant/proposals/brief/apply',
+    expect.objectContaining({ method: 'POST' })
+  );
+});
 test('supporting evidence stays inside one draft with one application action', () => {
   mount({
     proposals: [
@@ -57,6 +117,33 @@ test('supporting evidence stays inside one draft with one application action', (
   expect(screen.getByText('Second evidence block.')).toBeVisible();
   expect(screen.getByText('Third evidence block.')).toBeVisible();
   expect(screen.getByRole('heading', { name: 'Supporting evidence and feedback' })).toBeVisible();
+});
+
+test('voice drafts display the exact directions and explain their automatic generation handoff', async () => {
+  const user = userEvent.setup();
+  const description = 'Adult female voice with a slight, natural English accent.';
+  mount({
+    record: { _id: 'voice', kind: 'voice', revision: 4, production: {} },
+    proposals: [
+      {
+        _id: 'voice-proposal',
+        assetId: 'voice',
+        scope: 'asset',
+        baseRevision: 4,
+        title: 'Correct Kory voice',
+        text: 'Owner rejected male auditions.',
+        baseProduction: {},
+        production: { voiceDescription: description, items: [] }
+      }
+    ]
+  });
+  expect(screen.getByText(description)).toBeVisible();
+  expect(screen.getByText('Voice directions draft · awaiting application')).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Apply voice directions' }));
+  expect(request).toHaveBeenCalledWith('/studio/assistant/proposals/voice-proposal/apply', {
+    method: 'POST',
+    body: {}
+  });
 });
 
 test('scene revisions explain which shots retain approvals and which need timing review', () => {

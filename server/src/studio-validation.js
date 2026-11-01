@@ -42,6 +42,11 @@ export function number(value, label, min, max) {
 export function revision(value) {
   return number(value, 'Revision', 0, Number.MAX_SAFE_INTEGER);
 }
+function clipDuration(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 2 || value > 30)
+    fail('Clip duration must be a number between 2 and 30 seconds.');
+  return value;
+}
 export const kinds = [
   'character',
   'droid',
@@ -136,6 +141,10 @@ export function assetInput(input) {
           description: text(item.description ?? '', 'Option description'),
           mediaIds: [...new Set(list(item.mediaIds ?? [], 'Reference files', 30).map(id))],
           voiceId: text(item.voiceId ?? '', 'ElevenLabs voice ID', 200),
+          generatedVoiceId: text(item.generatedVoiceId ?? '', 'Generated voice preview ID', 200),
+          ...(item.voiceDescription !== undefined
+            ? { voiceDescription: text(item.voiceDescription, 'Audition voice description', 1000) }
+            : {}),
           voiceModel: text(item.voiceModel ?? '', 'Voice model', 100),
           archived: item.archived ?? false
         };
@@ -160,6 +169,10 @@ export function assetProductionInput(value = {}) {
   }
   return {
     managed: value.managed === true,
+    ...(value.characterAssetId ? { characterAssetId: id(value.characterAssetId) } : {}),
+    ...(value.voiceDescription !== undefined
+      ? { voiceDescription: text(value.voiceDescription, 'Prepared voice description', 1000) }
+      : {}),
     sourceMode,
     sourceUrl,
     sourceNotes: text(value.sourceNotes ?? '', 'Source evidence', 8000),
@@ -184,6 +197,15 @@ export function assetProductionInput(value = {}) {
               }
             : {}),
           mediaId: item.mediaId ? id(item.mediaId) : null,
+          ...(item.imageReferenceMediaIds !== undefined
+            ? {
+                imageReferenceMediaIds: [
+                  ...new Set(
+                    list(item.imageReferenceMediaIds, 'Image request references', 16).map(id)
+                  )
+                ]
+              }
+            : {}),
           ...(item.referenceMediaIds !== undefined
             ? {
                 referenceMediaIds: [
@@ -301,7 +323,8 @@ export function episodeInput(input) {
           location: text(scene.location ?? '', 'Location', 300),
           script: text(scene.script ?? '', 'Scene script', 20000),
           production: {
-            notes: text(scene.production?.notes ?? '', 'Scene production notes', 4000)
+            notes: text(scene.production?.notes ?? '', 'Scene production notes', 4000),
+            ...(scene.production?.manualGeneration ? { manualGeneration: true } : {})
           },
           assetIds: [...new Set(list(scene.assetIds ?? [], 'Scene assets', 30).map(id))],
           sourceReferenceIds: [
@@ -335,15 +358,22 @@ export function episodeInput(input) {
           clips: unique(
             list(scene.clips ?? [], 'Clips', 60).map((entry) => {
               const clip = object(entry);
+              const production = clipProductionInput(clip.production);
+              if (
+                production.referenceAssetIds?.some(
+                  (assetId) => !(scene.assetIds ?? []).includes(assetId)
+                )
+              )
+                fail("Choose this shot's reference assets from its scene.");
               return {
                 id: uid(clip.id),
                 title: text(clip.title, 'Clip title', 160, true),
-                duration: number(clip.duration, 'Clip duration', 2, 30),
+                duration: clipDuration(clip.duration),
                 action: text(clip.action ?? '', 'Action', 5000),
                 dialogue: text(clip.dialogue ?? '', 'Dialogue', 5000),
                 camera: text(clip.camera ?? '', 'Camera direction', 2000),
                 soundEffects: text(clip.soundEffects ?? '', 'Sound effects', 2000),
-                production: clipProductionInput(clip.production),
+                production,
                 dialogueTakeIds: [
                   ...new Set(list(clip.dialogueTakeIds ?? [], 'Dialogue takes', 30).map(id))
                 ],
@@ -395,9 +425,59 @@ function clipProductionInput(value = {}) {
     framing: text(value.framing ?? '', 'Framing', 300),
     beats: text(value.beats ?? '', 'Timed action beats', 3000),
     passCondition: text(value.passCondition ?? '', 'Pass conditions', 2000),
+    ...(value.imagePrompt
+      ? { imagePrompt: text(value.imagePrompt, 'Image generation prompt', 12000) }
+      : {}),
+    ...(value.videoPrompt
+      ? { videoPrompt: text(value.videoPrompt, 'Video generation prompt', 4500) }
+      : {}),
+    ...(value.videoTransitionPrompt
+      ? {
+          videoTransitionPrompt: text(
+            value.videoTransitionPrompt,
+            'Video transition instructions',
+            1500
+          )
+        }
+      : {}),
+    ...(value.videoEndFrame
+      ? {
+          videoEndFrame:
+            value.videoEndFrame.mode === 'none'
+              ? { mode: 'none' }
+              : value.videoEndFrame.mode === 'image'
+                ? {
+                    mode: 'image',
+                    assetId: id(value.videoEndFrame.assetId),
+                    mediaId: id(value.videoEndFrame.mediaId)
+                  }
+                : fail('Choose an approved end image or No end image.')
+        }
+      : {}),
+    ...(value.startState || value.endState || value.allowedMotion
+      ? {
+          startState: text(value.startState ?? '', 'Shot starting state', 1000),
+          endState: text(value.endState ?? '', 'Shot ending state', 1000),
+          allowedMotion: text(value.allowedMotion ?? '', 'Allowed movement', 1000)
+        }
+      : {}),
+    ...(value.imageReferenceMediaIds !== undefined
+      ? {
+          imageReferenceMediaIds: [
+            ...new Set(list(value.imageReferenceMediaIds, 'Image request references', 16).map(id))
+          ]
+        }
+      : {}),
     referenceMediaIds: [
       ...new Set(list(value.referenceMediaIds ?? [], 'Shot reference images', 12).map(id))
     ],
+    ...(value.referenceAssetIds !== undefined
+      ? {
+          referenceAssetIds: [
+            ...new Set(list(value.referenceAssetIds, 'Shot reference assets', 30).map(id))
+          ]
+        }
+      : {}),
     visualTakeId: value.visualTakeId ? id(value.visualTakeId) : null,
     upscaleMediaId: value.upscaleMediaId ? id(value.upscaleMediaId) : null,
     upscaleSourceTakeId: value.upscaleSourceTakeId ? id(value.upscaleSourceTakeId) : null

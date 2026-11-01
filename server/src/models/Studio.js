@@ -40,6 +40,8 @@ const candidate = new Schema(
     description: String,
     mediaIds: [{ type: Schema.Types.ObjectId, ref: 'StudioMedia' }],
     voiceId: String,
+    generatedVoiceId: String,
+    voiceDescription: String,
     voiceModel: String,
     continuitySources: [Schema.Types.Mixed],
     archived: { type: Boolean, default: false }
@@ -97,11 +99,13 @@ export const StudioMedia = mongoose.model(
       mime: String,
       kind: String,
       bytes: Number,
+      durationSeconds: Number,
       sha256: String,
       providerReference: Schema.Types.Mixed,
       providerUpload: Schema.Types.Mixed,
       projectKey: { type: String, default: projectKey, index: true },
       productionJobId: { type: String, index: true, sparse: true },
+      voiceDesign: Schema.Types.Mixed,
       soundMix: Schema.Types.Mixed,
       nativeAudio: Schema.Types.Mixed,
       musicCue: Schema.Types.Mixed,
@@ -177,6 +181,7 @@ const reviewSchema = scoped({
   state: String,
   fingerprint: String,
   approvalFingerprint: String,
+  contentFingerprint: String,
   clipApprovalFingerprints: Schema.Types.Mixed,
   feedback: String,
   revision: { type: Number, default: 0 },
@@ -207,6 +212,7 @@ const automationSchema = scoped({
   trigger: Schema.Types.Mixed,
   status: { type: String, default: 'queued', index: true },
   jobIds: [String],
+  failures: [Schema.Types.Mixed],
   error: String,
   leaseUntil: Date
 });

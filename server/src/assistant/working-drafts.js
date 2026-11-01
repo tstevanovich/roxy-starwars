@@ -4,6 +4,8 @@ import { Proposal } from './models.js';
 export function workingDraftKey(proposal) {
   if (proposal.render)
     return `video:${proposal.episodeId}:${proposal.render.target.sceneId}:${proposal.render.target.clipId}`;
+  if (proposal.scene && proposal.draftStage === 'shot-image' && proposal.targetClipId)
+    return `image:${proposal.episodeId}:${proposal.scene.id}:${proposal.targetClipId}`;
   if (proposal.scene) return `scene:${proposal.episodeId}:${proposal.scene.id}`;
   if (proposal.production)
     return proposal.assetId

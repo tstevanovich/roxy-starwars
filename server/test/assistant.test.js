@@ -11,8 +11,16 @@ import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
 import request from 'supertest';
 
+import { characterPackageItems } from '../../shared/character-package.js';
 import { createApp } from '../src/app.js';
-import { makeProposal, productionProposal, studioContext } from '../src/assistant/chat.js';
+import { characterVoice } from '../src/assistant/character-generation.js';
+import {
+  makeProposal,
+  productionProposal,
+  promptStudioContext,
+  proposeShotImage,
+  studioContext
+} from '../src/assistant/chat.js';
 import { inspectMedia } from '../src/assistant/inspect.js';
 import { Chat, Job, Message, Proposal, Run, SourceGrant } from '../src/assistant/models.js';
 import { speakerVoice } from '../src/assistant/production.js';
@@ -29,8 +37,11 @@ import { StudioSourceEvidence } from '../src/models/Studio.js';
 import { hashToken } from '../src/owner.js';
 import { workflowContext } from '../src/production-workflow.js';
 import { runProjectContext } from '../src/project-context.js';
+import { sceneEditToken } from '../src/scene-editor.js';
 import { saveGeneratedMedia } from '../src/studio-media.js';
+import { clipPrompts } from '../src/studio-prompts.js';
 import {
+  episodeInput,
   sceneFingerprint,
   soundPlanFingerprint,
   soundPlanInput
@@ -51,6 +62,42 @@ const png = Buffer.from(
   'base64'
 );
 const base = '/api/studio/assistant';
+test('chat context keeps complete focused work and record IDs without repeating package prompts or episode scenes', () => {
+  const clip = { id: 'focused', production: { endState: 'Roxy and Harkun remain planted.' } };
+  const focused = { id: 'scene', clips: [clip] };
+  const context = {
+    selectedScene: focused,
+    selectedClip: clip,
+    selectedEpisode: { _id: 'episode', videoGenerationHold: { active: true }, scenes: [focused] },
+    selectedAsset: { brief: 'Full focused creative brief.' },
+    library: [
+      {
+        _id: 'asset',
+        name: 'Kory',
+        brief: 'Design summary',
+        finalChoice: { id: 'chosen', mediaIds: ['image'], text: 'unused'.repeat(30000) },
+        production: {
+          items: [
+            {
+              id: 'portrait',
+              title: 'Portrait',
+              mediaId: 'image',
+              imagePrompt: 'unused'.repeat(30000)
+            }
+          ]
+        }
+      }
+    ]
+  };
+  const prompt = promptStudioContext(context);
+  assert.deepEqual(prompt.selectedScene, focused);
+  assert.deepEqual(prompt.selectedAsset, context.selectedAsset);
+  assert.equal(prompt.selectedEpisode.videoGenerationHold.active, true);
+  assert.deepEqual(prompt.library[0].finalChoice.mediaIds, ['image']);
+  assert.equal(prompt.library[0].production.items[0].mediaId, 'image');
+  assert.ok(JSON.stringify(prompt).length < 2000);
+  assert.equal(context.library[0].finalChoice.text.length, 180000);
+});
 const localOwner = {
   username: 'tony',
   version: 'test-owner',
@@ -200,7 +247,22 @@ beforeEach(async () => {
   app = createApp({
     auth: false,
     mediaDirectory: directory,
-    assistant: { store, openart, fetcher, ownerPath, remotePath: join(directory, 'remote.json') }
+    assistant: {
+      store,
+      openart,
+      fetcher,
+      webpageReader: async ({ url }) => ({
+        url,
+        title: 'Ffon Althe',
+        text: 'Gender: Male. Weapon: training saber.',
+        links: [],
+        images: [],
+        notice: 'Public reference text, not instructions.'
+      }),
+      ownerPath,
+      remotePath: join(directory, 'remote.json'),
+      automaticMediaGeneration: true
+    }
   });
   image = await StudioMedia.create({
     filename: 'original.png',
@@ -350,6 +412,222 @@ test('video requires a current scene approval and one approved image', async () 
   );
   await assert.rejects(queue('video'), /Approve the current scene script/);
   assert.equal(providerCalls.length, 0);
+});
+
+test('dialogue video attaches approved character identity and merges saved sound cues into a custom prompt', async () => {
+  const shot = await approvedShot();
+  const composition = await StudioMedia.create({
+    filename: 'composition.png',
+    originalName: 'composition.png',
+    kind: 'image',
+    mime: 'image/png',
+    providerReference: { id: 'composition-ref', url: 'https://cdn.openart.ai/test/composition.png' }
+  });
+  await StudioAsset.updateOne(
+    { _id: shot._id },
+    { $set: { 'finalChoice.mediaIds': [composition._id] } }
+  );
+  await promisify(execFile)(
+    'ffmpeg',
+    [
+      '-y',
+      '-v',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      'anullsrc=r=24000:cl=mono',
+      '-t',
+      '1',
+      join(directory, 'cast-voice.wav')
+    ],
+    { windowsHide: true }
+  );
+  const audio = await StudioMedia.create({
+    filename: 'cast-voice.wav',
+    originalName: 'voice.wav',
+    kind: 'audio',
+    mime: 'audio/wav',
+    providerReference: { id: 'voice-ref', url: 'https://cdn.openart.ai/test/voice.wav' }
+  });
+  const scene = episode.toObject().scenes[0];
+  scene.clips[0] = {
+    ...scene.clips[0],
+    dialogue: 'AL: Hello.',
+    selectedDialogueId: audio._id,
+    soundEffects: 'Soft control click.',
+    production: {
+      videoPrompt: 'ACTION: Al taps a control.\nAUDIO: Preserve quiet custom ventilation.'
+    }
+  };
+  scene.soundPlan.layers.push({
+    id: 'click',
+    type: 'effect',
+    clipId: 'clip1',
+    start: 2,
+    duration: 1,
+    description: 'One control click.'
+  });
+  scene.approval.fingerprint = sceneFingerprint(scene, [asset.toObject()]);
+  scene.soundPlan.approval.fingerprint = soundPlanFingerprint(scene, [asset.toObject()]);
+  await StudioEpisode.updateOne({ _id: episode._id }, { $set: { scenes: [scene] } });
+  const job = await queue('video');
+  const built = await app.locals.assistant.production.build(job);
+  assert.deepEqual(
+    built.params.visualReferences.map((ref) => ref.id),
+    ['composition-ref', 'original-ref', 'voice-ref']
+  );
+  assert.equal(built.params.visualReferences.at(-1).audioRole, 'voice_reference');
+  assert.match(built.params.prompt, /AL = @Image2 identity/);
+  assert.match(built.params.prompt, /Effect 2–3s: One control click/);
+  assert.match(built.params.prompt, /Preserve quiet custom ventilation/);
+  assert.match(built.params.prompt, /AL says: "Hello\."/);
+  assert.equal(providerCalls.filter((call) => call.name === 'openart_generate_video').length, 0);
+});
+
+test('ordinary shots save and render the next shot end image across a scene boundary in this episode', async () => {
+  await approvedShot();
+  const sourceScene = episode.toObject().scenes[0];
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    {
+      $set: {
+        scenes: [
+          sourceScene,
+          {
+            ...sourceScene,
+            id: 'next-scene',
+            clips: [{ ...sourceScene.clips[0], id: 'next-shot' }]
+          }
+        ]
+      }
+    }
+  );
+  const nextImage = await StudioMedia.create({
+    filename: 'next.png',
+    originalName: 'next.png',
+    kind: 'image',
+    mime: 'image/png',
+    providerReference: { id: 'next-ref', url: 'https://cdn.openart.ai/test/next.png' }
+  });
+  const nextAsset = await StudioAsset.create({
+    name: 'Next scene opening',
+    kind: 'environment',
+    episodeId: episode._id,
+    sceneId: 'next-scene',
+    clipId: 'next-shot',
+    finalChoice: { id: 'chosen', mediaIds: [nextImage._id] }
+  });
+  const endFrame = {
+    mode: 'image',
+    assetId: String(nextAsset._id),
+    mediaId: String(nextImage._id)
+  };
+  const changedScene = {
+    ...sourceScene,
+    clips: sourceScene.clips.map((clip) => ({
+      ...clip,
+      production: { ...clip.production, videoEndFrame: endFrame }
+    }))
+  };
+  await request(app)
+    .post('/api/studio/workflow/scene/save')
+    .send({
+      target: { scope: 'scene', recordId: String(episode._id), sceneId: sourceScene.id },
+      editToken: sceneEditToken(sourceScene),
+      scene: changedScene
+    })
+    .expect(200);
+  const saved = await StudioEpisode.findById(episode._id).lean();
+  assert.deepEqual(saved.scenes[0].clips[0].production.videoEndFrame, endFrame);
+  assert.equal(saved.scenes[0].clips[0].title, 'Al waits');
+  assert.equal(saved.scenes.length, 2);
+  const job = await queue('video');
+  const built = await app.locals.assistant.production.build(job);
+  assert.equal(built.mode, 'image2video');
+  assert.equal(built.params.startFrame.id, 'original-ref');
+  assert.equal(built.params.endFrame.id, 'next-ref');
+  assert.match(built.params.prompt, /END reference/);
+  assert.equal(providerCalls.filter((call) => call.name === 'openart_generate_video').length, 0);
+});
+
+test('numbered video parts send two ordered images with the approved voice and omit the final end image', async () => {
+  await promisify(execFile)(
+    'ffmpeg',
+    [
+      '-y',
+      '-v',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      'anullsrc=r=24000:cl=mono',
+      '-t',
+      '1',
+      join(directory, 'transition-voice.wav')
+    ],
+    { windowsHide: true }
+  );
+  const audio = await StudioMedia.create({
+    filename: 'transition-voice.wav',
+    originalName: 'voice.wav',
+    kind: 'audio',
+    mime: 'audio/wav',
+    providerReference: { id: 'voice-ref', url: 'https://cdn.openart.ai/test/voice.wav' }
+  });
+  const images = [image];
+  for (const part of [2, 3])
+    images.push(
+      await StudioMedia.create({
+        filename: `part-${part}.png`,
+        originalName: `part-${part}.png`,
+        kind: 'image',
+        mime: 'image/png',
+        providerReference: {
+          id: `part-${part}-ref`,
+          url: `https://cdn.openart.ai/test/part-${part}.png`
+        }
+      })
+    );
+  const scene = episode.toObject().scenes[0];
+  scene.clips = [1, 2, 3].map((part) => ({
+    ...scene.clips[0],
+    id: `clip${part}`,
+    title: `Exchange - part ${part} of 3`,
+    dialogue: 'ROXY: Hello.',
+    action: 'The speaker stays at the same mark.',
+    selectedDialogueId: audio._id,
+    dialogueTakeIds: [audio._id],
+    production: {}
+  }));
+  scene.approval.fingerprint = sceneFingerprint(scene, [asset.toObject()]);
+  scene.soundPlan.approval.fingerprint = soundPlanFingerprint(scene, [asset.toObject()]);
+  await StudioEpisode.updateOne({ _id: episode._id }, { $set: { scenes: [scene] } });
+  for (const [index, clip] of scene.clips.entries())
+    await StudioAsset.create({
+      name: clip.title,
+      kind: 'environment',
+      episodeId: episode._id,
+      sceneId: scene.id,
+      clipId: clip.id,
+      finalChoice: { id: 'chosen', mediaIds: [images[index]._id] }
+    });
+  for (const part of [1, 2, 3]) {
+    const job = await queue('video', { target: { ...target(), clipId: `clip${part}` } });
+    const built = await app.locals.assistant.production.build(job);
+    assert.equal(built.mode, 'element2video');
+    const refs = built.params.visualReferences;
+    assert.deepEqual(
+      refs.map((ref) => ref.id),
+      part < 3
+        ? [part === 1 ? 'original-ref' : 'part-2-ref', `part-${part + 1}-ref`, 'voice-ref']
+        : ['part-3-ref', 'voice-ref']
+    );
+    assert.equal(refs.at(-1).audioRole, 'voice_reference');
+    assert.match(built.params.prompt, part < 3 ? /@Image2 is the END/ : /This is the final part/);
+    assert.equal(built.params.promptExtend, false);
+  }
+  assert.equal(providerCalls.filter((call) => call.name === 'openart_generate_video').length, 0);
 });
 test('pending image replacements and dialogue performances block video even with an earlier approved image', async () => {
   const shot = await approvedShot();
@@ -666,7 +944,7 @@ test('chat removes a supporting block and later revisions cannot restore it', as
   assert.equal(result.status, 'pending');
   assert.equal(result.supportingNotes.length, 1);
   assert.deepEqual(result.removedSupportingNoteIds, [removedId]);
-  assert.deepEqual(result.scene, draft.scene);
+  assert.deepEqual(result.scene, JSON.parse(JSON.stringify(draft.scene)));
   assert.equal((await Proposal.findById(draft._id).lean()).status, 'superseded');
   await request(app).post(`${base}/proposals/${draft._id}/apply`).send({}).expect(409);
   assert.deepEqual(await StudioEpisode.findById(episode._id).lean(), before);
@@ -1447,12 +1725,17 @@ test('dialogue uses the exact finalized Eleven v3 voice and imports an unselecte
   current.scenes[0].approval.fingerprint = sceneFingerprint(current.scenes[0], [asset.toObject()]);
   await StudioEpisode.updateOne({ _id: episode._id }, { $set: { scenes: current.scenes } });
   let submitted;
+  const speechFixture = join(directory, 'dialogue-fixture.mp3');
+  await promisify(execFile)(
+    'ffmpeg',
+    ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=150:duration=1', speechFixture],
+    { windowsHide: true }
+  );
+  const mp3 = await readFile(speechFixture);
   fetchOverride = async (url, options) => {
     assert.match(url, /text-to-speech\/approved-al-voice\?output_format=mp3_44100_192$/);
     submitted = JSON.parse(options.body);
     assert.equal(options.headers['xi-api-key'], 'fixture-elevenlabs-key');
-    const mp3 = Buffer.alloc(32);
-    mp3.write('ID3');
     return new Response(mp3);
   };
   const savedKey = process.env.ELEVENLABS_API_KEY;
@@ -1553,4 +1836,552 @@ test('audio inspection returns saved script context without calling a transcript
   assert.equal(result.info.savedDialogue[0].script, 'AL: I object.');
   assert.match(result.info.limitation, /not a transcription/);
   assert.equal('transcript' in result.info, false);
+});
+
+test('shot conversation reopens the same context without starting a run or touching approvals', async () => {
+  const beforeEpisode = await StudioEpisode.findById(episode._id).lean();
+  const context = target();
+  const first = await request(app)
+    .post(base + '/chats')
+    .send({ context, reuseShot: true })
+    .expect(200);
+  const again = await request(app)
+    .post(base + '/chats')
+    .send({ context, reuseShot: true })
+    .expect(200);
+  assert.equal(first.body.chat._id, again.body.chat._id);
+  assert.deepEqual(first.body.chat.context, context);
+  assert.match(first.body.chat.title, /At the port \/ Al waits/);
+  const focused = await studioContext(context);
+  assert.equal(focused.selectedClip.id, 'clip1');
+  assert.equal(focused.selectedScene.id, 'scene1');
+  assert.equal(await Run.countDocuments(), 0);
+  assert.equal(await Job.countDocuments(), 0);
+  assert.equal(await Message.countDocuments(), 0);
+  assert.deepEqual(await StudioEpisode.findById(episode._id).lean(), beforeEpisode);
+  await request(app)
+    .post(base + '/chats')
+    .send({ context: { ...context, clipId: 'missing' }, reuseShot: true })
+    .expect(400);
+  assert.equal(providerCalls.length, 0);
+});
+
+test('production chat reads a webpage tool result and passes its source text back to the model without generating media', async () => {
+  const url = 'https://swtor.jedipedia.net/en/npc/ffon-althe-2';
+  aiReplies = [
+    {
+      output: [
+        {
+          type: 'function_call',
+          call_id: 'read-reference',
+          name: 'read_webpage',
+          arguments: JSON.stringify({ url })
+        }
+      ]
+    },
+    {
+      output: [
+        {
+          type: 'message',
+          content: [
+            {
+              type: 'output_text',
+              text: `I read [Ffon Althe](${url}) as a supplementary reference.`
+            }
+          ]
+        }
+      ]
+    }
+  ];
+  const run = await Run.create({ chatId: chat._id, status: 'running' });
+  await Chat.updateOne({ _id: chat._id }, { $set: { activeRun: String(run._id) } });
+  await Message.create({
+    chatId: chat._id,
+    role: 'user',
+    text: `Read ${url} for this character.`,
+    mediaIds: []
+  });
+  await app.locals.assistant.engine.run(run.toObject());
+  assert.equal((await Run.findById(run._id)).status, 'completed');
+  const tools = aiCalls[0].tools[0].tools;
+  assert.ok(tools.some((tool) => tool.name === 'read_webpage'));
+  const toolOutput = aiCalls[1].input.find(
+    (item) => item.type === 'function_call_output' && item.call_id === 'read-reference'
+  );
+  assert.match(toolOutput.output, /Gender: Male/);
+  assert.match(toolOutput.output, /swtor.jedipedia.net/);
+  assert.match(aiCalls[0].instructions, /WEBPAGE READING/);
+  assert.equal(await Job.countDocuments(), 0);
+  assert.equal(await Proposal.countDocuments(), 0);
+  assert.equal(providerCalls.length, 0);
+});
+
+test('character references expose exact image prompts and save a separate voice without reopening images or requiring a scene', async () => {
+  await StudioAsset.updateOne(
+    { _id: asset._id },
+    {
+      $set: {
+        production: {
+          sourceMode: 'original',
+          sourceNotes: 'An original droid.',
+          items: [
+            {
+              id: 'master-portrait',
+              title: 'Master portrait',
+              type: 'image',
+              required: true,
+              notes: 'A neutral portrait.',
+              mediaId: String(image._id),
+              imagePrompt: 'An exact photographed droid portrait.'
+            },
+            {
+              id: 'view-rear',
+              title: 'Rear view',
+              type: 'image',
+              required: true,
+              notes: 'Rear view.',
+              mediaId: null,
+              imagePrompt: 'An exact rear view.'
+            }
+          ]
+        }
+      }
+    }
+  );
+  const beforeCharacter = await StudioAsset.findById(asset._id).lean();
+  const endpoint = `${base}/character-generation/${asset._id}`;
+  const preview = await request(app).get(endpoint).expect(200);
+  assert.equal(preview.body.images[0].promptBase, 'An exact photographed droid portrait.');
+  assert.match(preview.body.images[0].prompt, /@image1: AL-1B/);
+  assert.equal(preview.body.images[1].promptBase, 'An exact rear view.');
+  assert.equal(await Job.countDocuments(), 0);
+  const saved = await request(app)
+    .put(endpoint + '/voice')
+    .send({
+      revision: asset.revision,
+      prompt: 'An adult female droid voice, low pitch and precise diction.'
+    })
+    .expect(200);
+  const voice = saved.body.voice;
+  assert.equal(voice.production.characterAssetId, String(asset._id));
+  assert.equal(
+    voice.production.voiceDescription,
+    'An adult female droid voice, low pitch and precise diction.'
+  );
+  assert.deepEqual(await StudioAsset.findById(asset._id).lean(), beforeCharacter);
+  assert.equal(await Job.countDocuments(), 0);
+  const current = await request(app).get(endpoint).expect(200);
+  assert.equal(current.body.voice._id, voice._id);
+  assert.equal(current.body.voicePrompt, voice.production.voiceDescription);
+  const savedKey = process.env.ELEVENLABS_API_KEY;
+  process.env.ELEVENLABS_API_KEY = 'fixture-elevenlabs-key';
+  try {
+    const job = await app.locals.assistant.production.voices.queue({
+      target: { assetId: voice._id },
+      speaker: saved.body.speaker,
+      requestId: randomUUID()
+    });
+    assert.equal(job.kind, 'voice');
+    assert.equal(job.payload.description, voice.production.voiceDescription);
+    assert.equal(job.target.episodeId, undefined);
+    assert.equal(job.status, 'queued');
+    assert.deepEqual(await StudioAsset.findById(asset._id).lean(), beforeCharacter);
+    assert.equal(providerCalls.length, 0);
+  } finally {
+    if (savedKey === undefined) delete process.env.ELEVENLABS_API_KEY;
+    else process.env.ELEVENLABS_API_KEY = savedKey;
+  }
+});
+
+test('saving one character image prompt preserves the other views and approved selection without generating media', async () => {
+  const items = [
+    {
+      id: 'master-portrait',
+      title: 'Master portrait',
+      type: 'image',
+      required: true,
+      notes: 'Portrait.',
+      mediaId: String(image._id),
+      imagePrompt: 'Approved portrait.'
+    },
+    {
+      id: 'view-rear',
+      title: 'Rear view',
+      type: 'image',
+      required: true,
+      notes: 'Rear.',
+      mediaId: String(image._id),
+      imagePrompt: 'Saved rear view.'
+    }
+  ];
+  await StudioAsset.updateOne(
+    { _id: asset._id },
+    { $set: { production: { sourceMode: 'original', sourceNotes: 'Original character.', items } } }
+  );
+  const before = await StudioAsset.findById(asset._id).lean();
+  const result = await request(app)
+    .put('/api/studio/assets/' + asset._id)
+    .send({
+      ...before,
+      production: {
+        ...before.production,
+        items: items.map((item) =>
+          item.id === 'view-rear' ? { ...item, imagePrompt: 'New exact rear view.' } : item
+        )
+      }
+    })
+    .expect(200);
+  assert.deepEqual(result.body.asset.production.items[0], items[0]);
+  assert.equal(result.body.asset.production.items[1].imagePrompt, 'New exact rear view.');
+  assert.equal(result.body.asset.finalChoice.id, before.finalChoice.id);
+  assert.equal(await Job.countDocuments(), 0);
+  assert.equal(providerCalls.length, 0);
+});
+
+test('character voice lookup reuses the Harkun voice despite its character honorific', () => {
+  const existing = {
+    _id: 'voice-harkun',
+    name: 'HARKUN - voice auditions',
+    aliases: ['HARKUN'],
+    kind: 'voice'
+  };
+  assert.equal(
+    characterVoice(
+      {
+        _id: 'harkun',
+        name: 'Overseer Harkun \u2014 recurring character production package',
+        aliases: []
+      },
+      [existing]
+    ),
+    existing
+  );
+  const al = { _id: 'al-voice', name: 'AL\u2019s voice', aliases: [], kind: 'voice' };
+  assert.equal(characterVoice({ _id: 'al', name: 'AL-1B', aliases: [] }, [al]), al);
+});
+
+test('character chat revisions, prompt preview and generation share the effective saved voice without changing image approvals', async () => {
+  const originalDirection = 'Adult male voice. Slight British accent and light natural gravel.';
+  const revisedDirection =
+    'Adult male voice. Subtle British accent, menacing delivery and light gravel. Clear diction.';
+  await StudioAsset.updateOne(
+    { _id: asset._id },
+    {
+      $set: {
+        brief:
+          'Visual appearance is established. Voice accent, pitch and delivery remain unconfirmed.',
+        'production.voiceDescription': originalDirection
+      }
+    }
+  );
+  const before = await StudioAsset.findById(asset._id).lean();
+  const endpoint = base + '/character-generation/' + asset._id;
+  const preview = await request(app).get(endpoint).expect(200);
+  assert.equal(preview.body.voicePrompt, originalDirection);
+  assert.equal(preview.body.voicePromptSource, 'saved-character');
+  const originalContext = await studioContext({ assetId: String(asset._id) });
+  assert.equal(originalContext.selectedVoice.prompt, originalDirection);
+  assert.equal(originalContext.selectedVoice.finalized, false);
+  const proposal = await productionProposal(chat._id, {
+    scope: 'asset',
+    recordId: String(asset._id),
+    title: 'Revised voice direction',
+    explanation: 'Use the owner requested menacing voice.',
+    production: { voiceDescription: revisedDirection }
+  });
+  assert.notEqual(proposal.assetId, String(asset._id));
+  assert.deepEqual(proposal.reviewStages, ['voice-directions']);
+  const pending = await request(app).get(endpoint).expect(200);
+  assert.equal(pending.body.voicePrompt, originalDirection);
+  const manualApp = createApp({
+    auth: false,
+    mediaDirectory: directory,
+    assistant: { store, automaticMediaGeneration: false }
+  });
+  try {
+    await request(manualApp)
+      .post(base + '/proposals/' + proposal._id + '/apply')
+      .send({})
+      .expect(200);
+    const applied = await request(manualApp).get(endpoint).expect(200);
+    assert.equal(applied.body.voicePrompt, revisedDirection);
+    assert.equal(applied.body.voice.production.voiceDescription, revisedDirection);
+    assert.equal(applied.body.voicePromptSource, 'saved-voice');
+    assert.equal(
+      (await studioContext({ assetId: String(asset._id) })).selectedVoice.prompt,
+      revisedDirection
+    );
+    assert.deepEqual(await StudioAsset.findById(asset._id).lean(), before);
+    await request(manualApp)
+      .post(base + '/voice/generate')
+      .send({
+        target: { assetId: applied.body.voice._id },
+        speaker: applied.body.speaker,
+        prompt: originalDirection,
+        requestId: randomUUID()
+      })
+      .expect(409);
+    assert.equal(await Job.countDocuments(), 0);
+    assert.equal(providerCalls.length, 0);
+  } finally {
+    await manualApp.locals.assistant.stop();
+  }
+});
+
+test('a partial portrait proposal keeps the full package in its preview and when an older partial draft is applied', async () => {
+  const items = characterPackageItems().map((item) =>
+    item.id === 'master-portrait'
+      ? { ...item, mediaId: String(image._id), imagePrompt: 'Existing portrait.' }
+      : item
+  );
+  await StudioAsset.updateOne(
+    { _id: asset._id },
+    {
+      $set: {
+        sheetLayout: 'production-package',
+        production: { sourceMode: 'original', sourceNotes: 'Saved original design.', items }
+      }
+    }
+  );
+  const before = await StudioAsset.findById(asset._id).lean();
+  const proposal = await productionProposal(chat._id, {
+    scope: 'asset',
+    recordId: String(asset._id),
+    title: 'Portrait framing change',
+    explanation: 'Revise only the portrait.',
+    production: { items: [{ id: 'master-portrait', imagePrompt: 'More frontal framing.' }] }
+  });
+  assert.equal(proposal.production.items.length, 9);
+  assert.deepEqual(proposal.production.items.slice(1), items.slice(1));
+  await Proposal.updateOne(
+    { _id: proposal._id },
+    { $set: { 'production.items': [proposal.production.items[0]] } }
+  );
+  const manualApp = createApp({
+    auth: false,
+    mediaDirectory: directory,
+    assistant: { store, automaticMediaGeneration: false }
+  });
+  try {
+    await request(manualApp)
+      .post(base + '/proposals/' + proposal._id + '/apply')
+      .send({})
+      .expect(200);
+    const saved = await StudioAsset.findById(asset._id).lean();
+    assert.equal(saved.production.items.length, 9);
+    assert.deepEqual(saved.production.items.slice(1), items.slice(1));
+    assert.equal(saved.production.items[0].imagePrompt, 'More frontal framing.');
+    assert.equal(saved.production.items[0].mediaId, String(image._id));
+    assert.deepEqual(saved.finalChoice, before.finalChoice);
+    assert.equal(await Job.countDocuments(), 0);
+    assert.equal(providerCalls.length, 0);
+  } finally {
+    await manualApp.locals.assistant.stop();
+  }
+});
+
+test('applying a shot image asset draft updates the episode prompt and exact references used by image generation only for that shot', async () => {
+  const saved = episode.toObject();
+  const sibling = {
+    ...saved.scenes[0].clips[0],
+    id: 'clip2',
+    title: 'Unrelated shot',
+    production: { videoPrompt: 'Keep the existing video prompt.' }
+  };
+  await StudioEpisode.updateOne({ _id: episode._id }, { $push: { 'scenes.0.clips': sibling } });
+  const shot = await StudioAsset.create({
+    name: 'Episode shot image',
+    kind: 'environment',
+    scope: 'episode',
+    episodeId: episode._id,
+    sceneId: 'scene1',
+    clipId: 'clip1',
+    brief: 'Old image notes.',
+    production: {
+      sourceMode: 'original',
+      items: [
+        {
+          id: 'composition',
+          title: 'Composition',
+          type: 'image',
+          required: true,
+          notes: 'Old notes.',
+          imagePrompt: 'Old image prompt.'
+        }
+      ]
+    },
+    candidates: [],
+    revision: 0
+  });
+  const before = await StudioEpisode.findById(episode._id).lean();
+  const prompt =
+    'One transport hovering high above the platform. Both complete wings visible. Gear retracted, ramp closed.';
+  const proposal = await productionProposal(chat._id, {
+    scope: 'asset',
+    recordId: String(shot._id),
+    title: 'Correct hovering image',
+    explanation: 'Preserve the correct transport and platform.',
+    production: {
+      items: [{ id: 'composition', imagePrompt: prompt, referenceMediaIds: [String(image._id)] }]
+    }
+  });
+  assert.equal(proposal.episodeId, String(episode._id));
+  assert.equal(proposal.targetClipId, 'clip1');
+  assert.equal(proposal.draftStage, 'shot-image');
+  assert.equal(proposal.scene.clips[0].production.imagePrompt, prompt);
+  assert.deepEqual(proposal.scene.clips[1], before.scenes[0].clips[1]);
+  assert.equal(
+    (await StudioEpisode.findById(episode._id)).scenes[0].clips[0].production.imagePrompt,
+    undefined
+  );
+  const manualApp = createApp({
+    auth: false,
+    mediaDirectory: directory,
+    assistant: { store, automaticMediaGeneration: false }
+  });
+  try {
+    await request(manualApp)
+      .post(base + '/proposals/' + proposal._id + '/apply')
+      .send({})
+      .expect(200);
+    const current = await StudioEpisode.findById(episode._id).lean();
+    assert.equal(current.scenes[0].clips[0].production.imagePrompt, prompt);
+    assert.deepEqual(current.scenes[0].clips[1], before.scenes[0].clips[1]);
+    assert.deepEqual(current.scenes[0].soundPlan, before.scenes[0].soundPlan);
+    const composed = clipPrompts(
+      current.scenes[0],
+      current.scenes[0].clips[0],
+      await StudioAsset.find().lean(),
+      current
+    );
+    assert.equal(composed.imageBase, prompt);
+    assert.match(composed.image, /@image1:/);
+    assert.deepEqual(composed.imageReferenceMediaIds, [String(image._id)]);
+    assert.equal(
+      (await studioContext({ assetId: String(shot._id) })).selectedImageGeneration.prompt,
+      composed.image
+    );
+    assert.equal(
+      (await studioContext({ assetId: String(shot._id) })).selectedClip.production.imagePrompt,
+      prompt
+    );
+    assert.equal(await Job.countDocuments(), 0);
+    assert.equal(providerCalls.length, 0);
+  } finally {
+    await manualApp.locals.assistant.stop();
+  }
+});
+
+test('shot image corrections route from an old parent asset to the focused split shot and preserve fractional timing', async () => {
+  const source = episode.toObject().scenes[0];
+  const first = { ...source.clips[0], duration: 6.5 };
+  const second = {
+    ...source.clips[0],
+    id: 'clip2',
+    title: 'Opening part 2',
+    duration: 11,
+    production: {
+      ...source.clips[0].production,
+      imagePrompt: 'Old wide shot.',
+      videoPrompt: 'Keep the saved video directions.'
+    }
+  };
+  await StudioEpisode.updateOne(
+    { _id: episode._id },
+    { $set: { 'scenes.0.clips': [first, second] } }
+  );
+  await Chat.updateOne(
+    { _id: chat._id },
+    { $set: { context: { episodeId: String(episode._id), sceneId: source.id, clipId: second.id } } }
+  );
+  const shot = await StudioAsset.create({
+    name: 'Original opening asset',
+    kind: 'environment',
+    scope: 'episode',
+    episodeId: episode._id,
+    sceneId: source.id,
+    clipId: first.id,
+    production: { items: [] },
+    revision: 0,
+    candidates: []
+  });
+  const before = await StudioEpisode.findById(episode._id).lean();
+  const prompt =
+    'Use @image1 as the close composition. Roxy back-left; Harkun faces her, arms crossed.';
+  const draft = await productionProposal(chat._id, {
+    scope: 'asset',
+    recordId: String(shot._id),
+    title: 'Use 16:51',
+    explanation: 'Replace the wide composition for part 2 only.',
+    production: { imagePrompt: prompt, imageReferenceMediaIds: [String(image._id)] }
+  });
+  assert.equal(episodeInput(JSON.parse(JSON.stringify(before))).scenes[0].clips[0].duration, 6.5);
+  assert.equal(draft.targetClipId, second.id);
+  assert.equal(draft.draftStage, 'shot-image');
+  assert.deepEqual(draft.scene.clips[0], before.scenes[0].clips[0]);
+  assert.equal(draft.scene.clips[0].duration, 6.5);
+  assert.equal(draft.scene.clips[1].production.imagePrompt, prompt);
+  await request(app)
+    .post(base + '/proposals/' + draft._id + '/apply')
+    .send({})
+    .expect(200);
+  const current = await StudioEpisode.findById(episode._id).lean();
+  assert.deepEqual(current.scenes[0].clips[0], before.scenes[0].clips[0]);
+  assert.equal(current.scenes[0].clips[1].production.imagePrompt, prompt);
+  assert.deepEqual(current.scenes[0].clips[1].production.imageReferenceMediaIds, [
+    String(image._id)
+  ]);
+  assert.equal(current.scenes[0].clips[1].production.videoPrompt, second.production.videoPrompt);
+  assert.equal(current.scenes[0].clips[1].duration, 11);
+  const empty = await proposeShotImage(chat._id, {
+    episodeId: String(episode._id),
+    sceneId: source.id,
+    clipId: second.id,
+    title: 'Prompt only',
+    explanation: 'No attachments.',
+    imagePrompt: 'One still.',
+    imageReferenceMediaIds: []
+  });
+  assert.deepEqual(empty.scene.clips[1].production.imageReferenceMediaIds, []);
+  await assert.rejects(
+    productionProposal(chat._id, {
+      scope: 'asset',
+      recordId: String(shot._id),
+      title: 'Unsupported field',
+      explanation: 'Do not silently discard this.',
+      production: { unsupportedImageDirections: 'New close shot.' }
+    }),
+    /no saved changes/
+  );
+  assert.equal(await Job.countDocuments(), 0);
+  assert.equal(providerCalls.length, 0);
+});
+
+test('a linked voice reference does not ask for visual source evidence again and links to the character evidence', async () => {
+  const before = (await workflowContext()).evaluate(
+    { scope: 'asset', recordId: String(asset._id) },
+    'source'
+  );
+  const voice = await request(app)
+    .put(base + '/character-generation/' + asset._id + '/voice')
+    .send({ revision: asset.revision, prompt: 'A natural adult droid voice.' })
+    .expect(200);
+  const voiceId = voice.body.voice._id;
+  const board = await request(app)
+    .post('/api/studio/workflow/board')
+    .send({ target: { scope: 'asset', recordId: voiceId }, boardVersion: 3 })
+    .expect(200);
+  assert.deepEqual(board.body.groups, []);
+  const linked = await request(app)
+    .get(base + '/character-generation/' + voiceId)
+    .expect(200);
+  assert.equal(linked.body.characterSource.assetId, String(asset._id));
+  assert.equal(linked.body.characterSource.status, before.status);
+  const after = (await workflowContext()).evaluate(
+    { scope: 'asset', recordId: String(asset._id) },
+    'source'
+  );
+  assert.equal(after.fingerprint, before.fingerprint);
+  assert.equal(after.status, before.status);
+  assert.equal(await Job.countDocuments(), 0);
 });

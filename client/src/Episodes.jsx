@@ -29,7 +29,6 @@ import { ShotProductionInputs } from './ProductionInputs.jsx';
 import { studioUrl } from './project-url.js';
 import RejectMediaButton from './RejectMediaButton.jsx';
 import ReviewLinks from './ReviewLinks.jsx';
-import SceneMusic from './SceneMusic.jsx';
 import ShotImageReview from './ShotImageReview.jsx';
 import SoundDesign from './SoundDesign.jsx';
 import SourceReferences from './SourceReferences.jsx';
@@ -155,6 +154,7 @@ function EpisodeEditor({
   const [notice, setNotice] = useState('');
   const [prompts, setPrompts] = useState(null);
   const [selectedScene, setSelectedScene] = useState('');
+  const pendingSceneJump = useRef(null);
   const episodeHeading = useRef(null);
   const sceneHeadings = useRef(new Map());
   const clipPanels = useRef(new Map());
@@ -163,14 +163,32 @@ function EpisodeEditor({
   const workflow = settings?.workflowVersion === 1;
   const native1080 = settings?.videoWorkflow === 'native-1080p';
   function jumpToScene(id) {
-    const heading = id ? sceneHeadings.current.get(id) : episodeHeading.current;
-    if (!heading) return;
     setSelectedScene(id);
-    heading.scrollIntoView({
-      behavior: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
-        ? 'instant'
-        : 'smooth',
-      block: 'start'
+    pendingSceneJump.current = id;
+  }
+  function finishSceneJump() {
+    const id = pendingSceneJump.current;
+    pendingSceneJump.current = null;
+    if (id === null) return;
+    // Wait for the menu's scroll lock and focus trap to be removed.
+    requestAnimationFrame(() => scrollToScene(id));
+  }
+  function scrollToScene(id) {
+    const boardScene = workflow && id ? document.getElementById(`board-scene-${id}`) : null;
+    const heading = boardScene || (id ? sceneHeadings.current.get(id) : episodeHeading.current);
+    if (!heading) return;
+    const address = new URL(window.location.href);
+    address.hash = boardScene ? `board-scene-${id}` : id ? `scene-edit-${id}` : 'episode-top';
+    window.history.replaceState(window.history.state, '', address);
+    const navigation = document.querySelector('.scene-navigation');
+    const inset = navigation
+      ? navigation.getBoundingClientRect().height +
+        (Number.parseFloat(window.getComputedStyle(navigation).top) || 0) +
+        12
+      : 12;
+    window.scrollTo({
+      top: Math.max(0, window.scrollY + heading.getBoundingClientRect().top - inset),
+      behavior: 'instant'
     });
     heading.focus({ preventScroll: true });
   }
@@ -411,14 +429,6 @@ function EpisodeEditor({
       }
     ]);
   }
-  const ready =
-    !dirty &&
-    (!workflow || draft.workflowReady) &&
-    draft.scenes.length > 0 &&
-    draft.scenes.every(
-      (s) =>
-        s.approvalStatus === 'approved' && s.clips.length && s.clips.every((c) => c.selectedTakeId)
-    );
   return (
     <Stack spacing={3}>
       {draft.videoPass?.policy === 'wan-native-effects-v1' && (
@@ -473,6 +483,52 @@ function EpisodeEditor({
           </Button>
         </Stack>
       </Stack>
+      {draft.scenes.length > 0 && (
+        <Box component="nav" aria-label="Scene navigation" className="scene-navigation">
+          <TextField
+            select
+            fullWidth
+            size="small"
+            label="Jump to scene"
+            value={selectedScene}
+            onChange={(e) => jumpToScene(e.target.value)}
+            slotProps={{
+              inputLabel: { shrink: true },
+              select: {
+                displayEmpty: true,
+                MenuProps: {
+                  disableRestoreFocus: true,
+                  slotProps: {
+                    paper: { sx: { maxHeight: 320 } },
+                    transition: { onExited: finishSceneJump }
+                  }
+                }
+              }
+            }}
+          >
+            <MenuItem
+              value=""
+              onClick={() => {
+                if (selectedScene === '') jumpToScene('');
+              }}
+            >
+              Top of episode
+            </MenuItem>
+            {draft.scenes.map((scene, index) => (
+              <MenuItem
+                key={scene.id}
+                value={scene.id}
+                sx={{ whiteSpace: 'normal' }}
+                onClick={() => {
+                  if (selectedScene === scene.id) jumpToScene(scene.id);
+                }}
+              >
+                {String(index + 1).padStart(2, '0')} · {scene.title || 'Untitled scene'}
+              </MenuItem>
+            ))}
+          </TextField>
+        </Box>
+      )}
       {error && (
         <Alert
           severity="error"
@@ -634,6 +690,8 @@ function EpisodeEditor({
           draftPending={dirty}
           onChanged={onReload}
           onImportUpscale={importUpscale}
+          onAssetSaved={onAssetSaved}
+          onRejected={onRejected}
         />
       ) : (
         <EnableWorkflow disabled={busy || dirty} />
@@ -665,49 +723,6 @@ function EpisodeEditor({
               }
             />
           </Stack>
-        </Box>
-      )}
-      {draft.scenes.length > 0 && (
-        <Box component="nav" aria-label="Scene navigation" className="scene-navigation">
-          <TextField
-            select
-            fullWidth
-            size="small"
-            label="Jump to scene"
-            value={selectedScene}
-            onChange={(e) => jumpToScene(e.target.value)}
-            slotProps={{
-              inputLabel: { shrink: true },
-              select: {
-                displayEmpty: true,
-                MenuProps: {
-                  disableRestoreFocus: true,
-                  slotProps: { paper: { sx: { maxHeight: 320 } } }
-                }
-              }
-            }}
-          >
-            <MenuItem
-              value=""
-              onClick={() => {
-                if (selectedScene === '') jumpToScene('');
-              }}
-            >
-              Top of episode
-            </MenuItem>
-            {draft.scenes.map((scene, index) => (
-              <MenuItem
-                key={scene.id}
-                value={scene.id}
-                sx={{ whiteSpace: 'normal' }}
-                onClick={() => {
-                  if (selectedScene === scene.id) jumpToScene(scene.id);
-                }}
-              >
-                {String(index + 1).padStart(2, '0')} · {scene.title || 'Untitled scene'}
-              </MenuItem>
-            ))}
-          </TextField>
         </Box>
       )}
       {(draft.sourceReferences?.length > 0 || settings.cinematicOnly) && (
@@ -764,6 +779,8 @@ function EpisodeEditor({
           />
           <TextField
             label="Episode continuity notes"
+            id="episode-continuity-notes"
+            sx={{ '& textarea': { scrollMarginTop: '200px' } }}
             multiline
             minRows={2}
             value={draft.notes}
@@ -795,7 +812,13 @@ function EpisodeEditor({
         </Box>
       )}
       {draft.scenes.map((scene, index) => (
-        <Box className="editor-panel scene-panel" key={scene.id}>
+        <Box
+          className="editor-panel scene-panel"
+          key={scene.id}
+          id={`scene-edit-${scene.id}`}
+          tabIndex={-1}
+          sx={{ scrollMarginTop: '110px' }}
+        >
           <Stack
             direction={{
               xs: 'column',
@@ -967,15 +990,6 @@ function EpisodeEditor({
                   onChange={(e) => sceneEdit(scene.id, { sourceNotes: e.target.value })}
                 />
               </>
-            )}
-            {workflow && (
-              <SceneMusic
-                episode={draft}
-                scene={scene}
-                dirty={dirty}
-                busy={busy}
-                onReload={onReload}
-              />
             )}
             <SoundDesign
               episode={draft}
@@ -1165,6 +1179,8 @@ function EpisodeEditor({
                     }
                   />
                   <TextField
+                    id={`shot-dialogue-${clip.id}`}
+                    sx={{ '& textarea': { scrollMarginTop: '200px' } }}
                     label="Exact dialogue with speaker names"
                     multiline
                     minRows={2}
@@ -1501,7 +1517,7 @@ function EpisodeEditor({
             mb: 1
           }}
         >
-          Prompts and editing package
+          Production prompts and notes
         </Typography>
         <Typography
           color="text.secondary"
@@ -1509,8 +1525,8 @@ function EpisodeEditor({
             mb: 3
           }}
         >
-          Review separate image and video directions. Final assembly and background music stay in
-          CapCut.
+          Review generator directions here. Download approved videos and separate background music
+          from each scene on the production board.
         </Typography>
         <Stack
           direction="row"
@@ -1529,32 +1545,14 @@ function EpisodeEditor({
           <Button
             component="a"
             href={studioUrl(`/api/studio/episodes/${draft._id}/brief`)}
+            download
+            target="_blank"
+            rel="noopener"
             startIcon={<DownloadOutlined />}
-            disabled={dirty}
           >
             Download production brief
           </Button>
-          <Button
-            component="a"
-            href={ready ? studioUrl(`/api/studio/episodes/${draft._id}/package`) : undefined}
-            variant="contained"
-            startIcon={<DownloadOutlined />}
-            disabled={!ready}
-          >
-            Download CapCut package
-          </Button>
         </Stack>
-        <Typography
-          variant="caption"
-          color="text.secondary"
-          sx={{
-            display: 'block',
-            mt: 2
-          }}
-        >
-          The editing ZIP contains selected originals and an ordered manifest. Every scene must be
-          approved and every clip must have a selected video take.
-        </Typography>
       </Box>
       {prompts?.map((p) => (
         <Box className="editor-panel" key={p.clipId}>
@@ -1692,7 +1690,7 @@ export default function Episodes({
               mt: 1
             }}
           >
-            From the first idea to the clips you take into CapCut.
+            Plan scenes, review one video at a time, and download approved takes.
           </Typography>
         </Box>
         <Button variant="contained" startIcon={<AddOutlined />} onClick={() => setCreating(true)}>

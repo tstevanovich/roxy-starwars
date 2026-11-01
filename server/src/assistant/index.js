@@ -2,8 +2,9 @@ import { randomUUID } from 'node:crypto';
 
 import { json, Router } from 'express';
 
-import { imageRevisionReview } from '../../../shared/asset-image-prompts.js';
+import { imageRevisionReview, packageImagePrompt } from '../../../shared/asset-image-prompts.js';
 import {
+  mergeAssetBrief,
   mergeAssetProduction,
   mergeSceneProposal,
   proposalApplication
@@ -12,10 +13,12 @@ import { unchangedShotImage } from '../../../shared/shot-revisions.js';
 import { StudioAsset, StudioAutomation, StudioEpisode, StudioMedia } from '../models/Studio.js';
 import { hashToken, readOwner } from '../owner.js';
 import { workflowContext, workflowEnabled } from '../production-workflow.js';
+import { projectEra, projectKey } from '../project-context.js';
 import { assertMediaAccess } from '../projects.js';
 import { mediaView } from '../studio-media.js';
 import { fail, id, text } from '../studio-validation.js';
 import { createWorkflowAutomation } from '../workflow-automation.js';
+import { characterGenerationRouter } from './character-generation.js';
 import { createChatEngine } from './chat.js';
 import { createChatGPT } from './chatgpt.js';
 import { Chat, Job, Message, Proposal, Run, SourceGrant } from './models.js';
@@ -25,6 +28,8 @@ import { episodePlan, supersedeEpisodeProposals } from './proposal-input.js';
 import { registerSourceVideo } from './source-capture.js';
 import { createSecretStore } from './store.js';
 import { createStoryQueue } from './story-automation.js';
+import { voiceRevisionFields } from './voice-production.js';
+import { voiceDirection } from './voice-production.js';
 
 function jobView(job) {
   const {
@@ -65,11 +70,14 @@ export function createAssistant({
   store = createSecretStore(secretDirectory),
   openart = createOpenArt(store, { ownerPath }),
   chatgpt,
-  fetcher = fetch
+  fetcher = fetch,
+  automaticMediaGeneration = false,
+  webpageReader
 } = {}) {
   const router = Router(),
     publicRouter = Router();
   router.use(json({ limit: '128kb' }));
+  router.use('/character-generation', characterGenerationRouter());
   const shutdown = new AbortController();
   const workerFetch = (url, options = {}) =>
     fetcher(url, {
@@ -85,9 +93,13 @@ export function createAssistant({
   });
   const planClient = chatgpt ?? createChatGPT({ store, ownerPath, fetcher: workerFetch });
   const automation = createWorkflowAutomation(production, {
+    automaticMediaGeneration,
+    mediaDirectory,
     queueStory: createStoryQueue(planClient)
   });
   const engine = createChatEngine({
+    automaticMediaGeneration,
+    webpageReader,
     chatgpt: planClient,
     production,
     mediaDirectory,
@@ -270,6 +282,56 @@ export function createAssistant({
     res.json({ jobs: jobs.map(jobView) });
   });
   router.get('/music', async (req, res) => res.json(await production.music.status(req.query)));
+  router.post('/image/generate', async (req, res) => {
+    const asset = await StudioAsset.findById(id(req.body.assetId)).lean();
+    if (!asset || asset.revision !== req.body.revision)
+      fail('The asset changed. Review its saved prompt before generating.', 409);
+    const item = asset.production?.items?.find((i) => i.id === req.body.packageItemId);
+    if (!item || item.type !== 'image') fail('Choose an image in this reference package.');
+    const context = await workflowContext();
+    if (
+      req.body.prompt !==
+      packageImagePrompt(asset, item, {
+        era: projectEra(),
+        assets: context.assets,
+        workflow: workflowEnabled()
+      })
+    )
+      fail('The image prompt changed. Review the saved prompt before generating.', 409);
+    const job = await production.queue({
+      kind: 'image',
+      requestId: text(req.body.requestId, 'Image request ID', 100, true),
+      target: { assetId: String(asset._id), packageItemId: item.id },
+      instructions: ''
+    });
+    res.status(202).json({ job: jobView(job) });
+    void kick();
+  });
+  router.post('/voice/generate', async (req, res) => {
+    const context = await workflowContext();
+    const speaker = text(req.body.speaker, 'Speaker', 80, true);
+    const selectedVoice = req.body.target?.assetId
+      ? context.assets.find(
+          (asset) =>
+            String(asset._id) === id(req.body.target.assetId) &&
+            asset.kind === 'voice' &&
+            !asset.archived
+        )
+      : null;
+    if (req.body.target?.assetId && !selectedVoice) fail('Choose a saved voice reference.');
+    const expectedPrompt = selectedVoice
+      ? selectedVoice.production?.voiceDescription?.trim()
+      : voiceDirection(speaker, context.assets);
+    if (req.body.prompt !== expectedPrompt)
+      fail('The voice directions changed. Review the saved prompt before generating.', 409);
+    const job = await production.voices.queue({
+      target: req.body.target,
+      speaker,
+      requestId: text(req.body.requestId, 'Voice request ID', 100, true)
+    });
+    res.status(202).json({ job: jobView(job) });
+    void kick();
+  });
   router.post('/source-video', async (req, res) =>
     res.json({
       media: mediaView(await registerSourceVideo(req.body, { mediaDirectory })),
@@ -308,8 +370,38 @@ export function createAssistant({
     const context = req.body.context ?? {};
     if (context.assetId && !(await StudioAsset.exists({ _id: id(context.assetId) })))
       fail('Asset not found.');
-    if (context.episodeId && !(await StudioEpisode.exists({ _id: id(context.episodeId) })))
-      fail('Episode not found.');
+    const focusedEpisode = context.episodeId
+      ? await StudioEpisode.findById(id(context.episodeId)).lean()
+      : null;
+    if (context.episodeId && !focusedEpisode) fail('Episode not found.');
+    const focusedScene = focusedEpisode?.scenes.find((scene) => scene.id === context.sceneId);
+    const focusedClip = focusedScene?.clips.find((clip) => clip.id === context.clipId);
+    if (context.sceneId && !focusedScene) fail('Scene not found.');
+    if (context.clipId && !focusedClip) fail('Shot not found.');
+    if (req.body.reuseShot) {
+      if (!focusedClip || context.assetId || context.packageItemId)
+        fail('Choose an episode, scene and shot for a shot conversation.');
+      const workflowKey = `shot-chat:${projectKey()}:${focusedEpisode._id}:${focusedScene.id}:${focusedClip.id}`;
+      const savedContext = {
+        episodeId: String(focusedEpisode._id),
+        sceneId: focusedScene.id,
+        clipId: focusedClip.id
+      };
+      const title = `${focusedScene.title} / ${focusedClip.title}`.slice(0, 160);
+      let chat;
+      try {
+        chat = await Chat.findOneAndUpdate(
+          { workflowKey },
+          { $setOnInsert: { workflowKey, title, context: savedContext } },
+          { upsert: true, new: true }
+        ).lean();
+      } catch (error) {
+        if (error.code !== 11000) throw error;
+        chat = await Chat.findOne({ workflowKey }).lean();
+        if (!chat) throw error;
+      }
+      return res.json({ chat });
+    }
     if (context.packageItemId) {
       const asset = context.assetId && (await StudioAsset.findById(context.assetId).lean());
       if (!asset?.production?.items?.some((item) => item.id === context.packageItemId))
@@ -439,6 +531,9 @@ export function createAssistant({
       } else if (record.revision !== proposal.baseRevision)
         fail('The record changed. Request a revised plan against the latest saved version.', 409);
       const production = assetPlan ? mergeAssetProduction(proposal, record) : proposal.production;
+      const brief =
+        assetPlan && proposal.brief !== undefined ? mergeAssetBrief(proposal, record) : undefined;
+      if (record.kind === 'voice' && brief !== undefined) production.voiceDescription = brief;
       await assertMediaAccess([
         ...(production.sourceMediaIds ?? []),
         ...(production.items ?? [])
@@ -465,9 +560,12 @@ export function createAssistant({
       const plan =
         proposal.scope === 'episode'
           ? episodePlan(record, proposal)
-          : {
-              production
-            };
+          : record.kind === 'voice' && production.voiceDescription
+            ? voiceRevisionFields(record, production)
+            : {
+                production,
+                ...(brief !== undefined ? { brief } : {})
+              };
       const result = await Model.updateOne(
         { _id: record._id, revision: record.revision },
         {
@@ -491,10 +589,18 @@ export function createAssistant({
       if (!result.modifiedCount) fail('The record changed while applying this plan.', 409);
       await Proposal.updateOne({ _id: proposal._id }, { $set: { status: 'applied' } });
       await supersedeEpisodeProposals(proposal, record);
+      const automation =
+        assetPlan && record.kind === 'voice' && production.voiceDescription
+          ? await req.app.locals.assistant.automation.afterApproval(
+              { scope: 'asset', recordId: String(record._id) },
+              { voiceDirectionsApplied: String(proposal._id), revision: record.revision + 1 }
+            )
+          : [];
       return res.json({
         applied: true,
         episodeId: proposal.episodeId,
         assetId: proposal.assetId,
+        ...(automation.length ? { automation: automation[0] } : {}),
         ...(revisionItems.length
           ? {
               nextReview: {
@@ -516,7 +622,9 @@ export function createAssistant({
       fields = {
         scenes: episode.scenes.some((s) => s.id === proposal.scene.id)
           ? episode.scenes.map((s) =>
-              s.id === proposal.scene.id ? mergeSceneProposal(proposal.scene, s) : s
+              s.id === proposal.scene.id
+                ? mergeSceneProposal(proposal.scene, s, proposal.targetClipId)
+                : s
             )
           : [...episode.scenes, { ...proposal.scene, approval: null }]
       };
@@ -552,6 +660,7 @@ export function createAssistant({
     if (!result.modifiedCount) fail('The episode changed while applying this draft.', 409);
     if (proposal.scene) {
       const previous = episode.scenes.find((s) => s.id === proposal.scene.id);
+      const appliedScene = fields.scenes.find((scene) => scene.id === proposal.scene.id);
       // A sound-only plan must not reopen approved image decisions.
       const shots = await StudioAsset.find({
         episodeId: episode._id,
@@ -560,7 +669,7 @@ export function createAssistant({
         finalChoice: { $ne: null }
       }).lean();
       for (const shot of shots) {
-        if (unchangedShotImage(previous, proposal.scene, shot.clipId)) continue;
+        if (unchangedShotImage(previous, appliedScene, shot.clipId)) continue;
         const snapshot = { ...shot };
         delete snapshot.history;
         await StudioAsset.updateOne(
@@ -600,10 +709,15 @@ export function createAssistant({
       fail('This job has already started. Review its result when ready.', 409);
     res.json({ cancelled: true });
   });
+  let nextProductionRecovery = 0;
   async function tick() {
     if (busy || stopped) return;
     busy = true;
     try {
+      if (Date.now() >= nextProductionRecovery) {
+        nextProductionRecovery = Date.now() + 30000;
+        await automation.reconcileProduction();
+      }
       const run = await Run.findOneAndUpdate(
         { status: 'queued' },
         { $set: { status: 'running' } },
@@ -646,6 +760,17 @@ export function createAssistant({
     store,
     async start() {
       stopped = false;
+      if (!automaticMediaGeneration)
+        await Job.updateMany(
+          { requestId: /^workflow-/, status: { $in: ['queued', 'preparing'] } },
+          {
+            $set: {
+              status: 'cancelled',
+              error:
+                'Automatic generation is disabled. Review the prompt and use its Generate button.'
+            }
+          }
+        );
       for (const proposal of await Proposal.find({
         status: 'approving',
         render: { $exists: true }
@@ -706,6 +831,7 @@ export function createAssistant({
       );
       await Job.updateMany({ status: 'preparing' }, { $set: { status: 'queued' } });
       await StudioAutomation.updateMany({ status: 'running' }, { $set: { status: 'queued' } });
+      await automation.reconcileSceneApprovals();
       await automation.reconcilePlanning();
       timer = setInterval(() => void kick(), 2500);
       timer.unref();

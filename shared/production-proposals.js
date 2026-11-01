@@ -1,4 +1,10 @@
+import { scopeAddedReferences } from './shot-references.js';
+
 export function proposalReviewStages(proposal, record) {
+  if (proposal.brief !== undefined && (proposal.scope === 'asset' || proposal.assetId))
+    return ['brief'];
+  if (record?.kind === 'voice' && proposal.production?.voiceDescription)
+    return ['voice-directions'];
   if (proposal.reviewStages?.length) return proposal.reviewStages;
   if (proposal.render) return ['video-revision'];
   if (proposal.scene) return ['scene'];
@@ -19,14 +25,17 @@ export function proposalReviewStages(proposal, record) {
 }
 
 export function proposalStageLabel(proposal, record) {
+  if (proposal.draftStage === 'shot-image') return 'Shot image prompt';
   const stages = proposalReviewStages(proposal, record);
   const labels = {
     source: 'Source research',
     outline: 'Episode outline',
+    brief: 'Creative brief',
     scene: 'Scene',
     'shot-plan': 'Shot plan',
     'sound-plan': 'Sound plan',
     'reference-package': 'Reference package',
+    'voice-directions': 'Voice directions',
     'video-revision': 'Video revision'
   };
   return stages.length ? stages.map((stage) => labels[stage]).join(' and ') : 'Episode note';
@@ -44,6 +53,11 @@ export function proposalBlocksReview(proposal, stage, record, target) {
     return proposalReviewStages(proposal, record).some(
       (reviewStage) => reviewStage === stage || (reviewStage === 'scene' && stage === 'script')
     );
+  if (target?.scope === 'clip' && proposal.scene?.id === target.sceneId && proposal.timingRepair)
+    return (
+      proposal.timingRepair.repairs.some((repair) => repair.clipId === target.clipId) &&
+      ['animatic', 'visual'].includes(stage)
+    );
   if (stage === 'source')
     return (
       (proposal.production?.sourceNotes !== undefined &&
@@ -57,6 +71,7 @@ export function proposalBlocksReview(proposal, stage, record, target) {
       (proposal.production?.outline !== undefined &&
         proposal.production.outline !== record.production?.outline)
     );
+  if (stage === 'brief') return proposal.brief !== undefined && proposal.brief !== record.brief;
   return false;
 }
 
@@ -101,12 +116,14 @@ const equal = (a, b) => JSON.stringify(canonical(a)) === JSON.stringify(canonica
 
 // Apply only fields deliberately changed from the draft's saved baseline.
 // Imported/deleted reference files and unrelated package edits remain current.
-export function mergeAssetProduction(proposal, record) {
-  const base =
-    proposal.baseProduction ??
-    (record.revision === proposal.baseRevision
-      ? record.production
-      : record.history?.find((s) => s.revision === proposal.baseRevision)?.production);
+// A chat draft lists edited items, not a replacement package. Only the direct
+// owner editor can explicitly remove omitted items.
+export function mergeAssetProduction(proposal, record, { allowItemRemoval = false } = {}) {
+  const snapshot =
+    record.revision === proposal.baseRevision
+      ? record
+      : record.history?.find((s) => s.revision === proposal.baseRevision);
+  const base = proposal.baseProduction ?? (snapshot ? (snapshot.production ?? {}) : null);
   if (!base) return null;
   const empty = (value) =>
     value === undefined ||
@@ -124,13 +141,16 @@ export function mergeAssetProduction(proposal, record) {
     }
     return output;
   };
-  const production = merge(base, proposal.production, record.production, ['items', 'managed']);
+  const production = merge(base, proposal.production, record.production ?? {}, [
+    'items',
+    'managed'
+  ]);
   if (!production) return null;
   const original = new Map((base.items ?? []).map((i) => [i.id, i]));
   const current = new Map((record.production?.items ?? []).map((i) => [i.id, i]));
   const proposed = new Map((proposal.production.items ?? base.items ?? []).map((i) => [i.id, i]));
   for (const [key, before] of original) {
-    if (proposed.has(key)) continue;
+    if (!allowItemRemoval || proposed.has(key)) continue;
     if (current.has(key) && !equal(current.get(key), before)) return null;
     current.delete(key);
   }
@@ -148,14 +168,35 @@ export function mergeAssetProduction(proposal, record) {
       current.set(key, merged);
     }
   }
-  return { ...production, items: [...current.values()], managed: true };
+  return {
+    ...production,
+    items: [...current.values()],
+    managed: record.clipId ? Boolean(record.production?.managed) : true
+  };
 }
 
+// Keep an independently edited owner brief safe when rebasing package changes.
+export function mergeAssetBrief(proposal, record) {
+  if (proposal.brief === undefined) return record.brief ?? '';
+  const base =
+    proposal.baseBrief ??
+    (record.revision === proposal.baseRevision
+      ? record.brief
+      : record.history?.find((snapshot) => snapshot.revision === proposal.baseRevision)?.brief);
+  if (base === undefined || ((record.brief ?? '') !== base && record.brief !== proposal.brief))
+    return null;
+  return proposal.brief;
+}
 // A saved note or a take decision must not strand an otherwise unchanged scene draft.
 // Rebase only when the targeted scene and episode preparation are still unchanged.
 export function proposalApplication(proposal, record) {
   if (!record) return { canApply: false, reason: 'The saved record is missing.' };
-  if (proposal.production && (proposal.scope === 'asset' || proposal.assetId))
+  if (proposal.production && (proposal.scope === 'asset' || proposal.assetId)) {
+    if (mergeAssetBrief(proposal, record) === null)
+      return {
+        canApply: false,
+        reason: 'The Creative brief has newer edits. Refresh this draft before replacing it.'
+      };
     return mergeAssetProduction(proposal, record)
       ? { canApply: true, rebased: proposal.baseRevision !== record.revision }
       : {
@@ -163,6 +204,7 @@ export function proposalApplication(proposal, record) {
           reason:
             'This asset draft conflicts with newer edits to the same source or reference instructions, or its saved base is unavailable. Refresh the draft before applying.'
         };
+  }
   if (proposal.baseRevision === record.revision) return { canApply: true, rebased: false };
   // Notes append through a CAS save; they never replace newer scene or planning fields.
   if (!proposal.scene && !proposal.production && !proposal.render)
@@ -189,11 +231,12 @@ export function proposalApplication(proposal, record) {
   };
 }
 
-export function mergeSceneProposal(proposed, current) {
+export function mergeSceneProposal(proposed, current, targetClipId) {
+  const scoped = scopeAddedReferences(current, proposed, targetClipId);
   return {
-    ...proposed,
+    ...scoped,
     approval: null,
-    clips: proposed.clips.map((clip) => {
+    clips: scoped.clips.map((clip) => {
       const saved = current?.clips?.find((item) => item.id === clip.id);
       if (!saved) return clip;
       const merged = { ...clip, production: { ...clip.production } };
@@ -201,6 +244,7 @@ export function mergeSceneProposal(proposed, current) {
       for (const key of productionOutputs) merged.production[key] = saved.production?.[key];
       if ((clip.dialogue ?? '') !== (saved.dialogue ?? '')) {
         merged.selectedDialogueId = null;
+        merged.dialogueTakeIds = [];
         merged.production.cleanDialogueMediaId = null;
       }
       return merged;

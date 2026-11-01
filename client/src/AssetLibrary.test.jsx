@@ -85,6 +85,15 @@ test.each(['character', 'droid', 'prop', 'environment'])(
     };
     let approved = false;
     vi.mocked(request).mockImplementation(async (path) => {
+      if (path === '/studio/assistant/character-generation/' + asset._id)
+        return {
+          asset,
+          voice: null,
+          speaker: 'Character',
+          voicePrompt: 'A separate voice prompt.',
+          images: [],
+          jobs: []
+        };
       if (path === '/studio/workflow/review') {
         approved = true;
         return { review: { state: 'approved' } };

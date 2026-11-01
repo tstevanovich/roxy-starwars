@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
 
 import { shotContinuity } from '../../shared/shot-continuity.js';
+import { shotAssetIds } from '../../shared/shot-references.js';
 import { shotImageInputs } from '../../shared/shot-revisions.js';
+import { motionInput } from '../../shared/video-readiness.js';
 
 const canonical = (value) =>
   Array.isArray(value)
@@ -24,7 +26,9 @@ export function clipApprovalInputs({ episode, scene, clip, assets, media }, stag
     return mid ? { id: String(mid), sha: m?.sha256, kind: m?.kind } : null;
   };
   const explicit = (clip.production?.referenceMediaIds ?? []).map(String);
-  const linked = assets.filter((a) => scene.assetIds.map(String).includes(String(a._id)));
+  const linked = assets.filter((a) =>
+    shotAssetIds(scene, clip, assets).map(String).includes(String(a._id))
+  );
   let references = linked.filter(
     (a) =>
       !explicit.length ||
@@ -74,6 +78,12 @@ export function clipApprovalInputs({ episode, scene, clip, assets, media }, stag
       .sort((a, b) => a.id.localeCompare(b.id))
   };
   const timing = {
+    ...(clip.production?.videoPrompt ? { videoPrompt: clip.production.videoPrompt } : {}),
+    ...(clip.production?.videoEndFrame ? { videoEndFrame: clip.production.videoEndFrame } : {}),
+    ...(clip.production?.videoTransitionPrompt
+      ? { videoTransitionPrompt: clip.production.videoTransitionPrompt }
+      : {}),
+    ...motionInput(clip.production),
     composition,
     duration: clip.duration,
     dialogue: clip.dialogue ?? '',

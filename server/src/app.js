@@ -57,10 +57,16 @@ export function createApp({ serveClient = false, mediaDirectory, auth = {}, assi
         return res.status(404).json({ message: 'Route not found.' });
       next();
     });
-    app.use(express.static(clientDist));
+    app.use(
+      express.static(clientDist, {
+        setHeaders: (res, filename) => {
+          if (filename.endsWith('index.html')) res.set('Cache-Control', 'no-store');
+        }
+      })
+    );
     app.get('/{*path}', (req, res, next) => {
       if (!req.accepts('html') || path.extname(req.path)) return next();
-      res.sendFile(path.join(clientDist, 'index.html'));
+      res.set('Cache-Control', 'no-store').sendFile(path.join(clientDist, 'index.html'));
     });
   }
   app.use((_req, res) => res.status(404).json({ message: 'Route not found.' }));

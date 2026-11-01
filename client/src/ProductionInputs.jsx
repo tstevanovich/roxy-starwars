@@ -145,7 +145,7 @@ export function AssetProductionInputs({
                 label="Exact image prompt sent to OpenArt"
                 multiline
                 minRows={4}
-                value={item.imagePrompt ?? ''}
+                value={cleanRenderPrompt(item.imagePrompt ?? '')}
                 helperText="Complete visual instructions for this image only. Planning notes, approvals, voice settings and credit details are kept separately."
                 onChange={(e) => itemChange(item.id, { imagePrompt: e.target.value })}
               />
@@ -440,3 +440,4 @@ export function ShotProductionInputs({ clip, media, onEdit, assets = [], scene, 
     </Stack>
   );
 }
+import { cleanRenderPrompt } from '../../shared/render-prompt.js';

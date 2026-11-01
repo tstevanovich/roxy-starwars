@@ -19,9 +19,11 @@ import {
 import { useState } from 'react';
 
 import { request } from './api.js';
+import CharacterGeneration from './CharacterGeneration.jsx';
 import CharacterSheets from './CharacterSheets.jsx';
 import ProductionBoard, { EnableWorkflow } from './ProductionBoard.jsx';
 import { AssetProductionInputs } from './ProductionInputs.jsx';
+import { assetFinalizationAnchor } from './review-navigation.js';
 import ShotImageReview from './ShotImageReview.jsx';
 import {
   assetStatus,
@@ -273,7 +275,24 @@ export function AssetEditor({
           ))}
         </Box>
       )}
-      {!draft.clipId && workflowVersion === 1 && (
+      {!draft.clipId &&
+        ['character', 'droid', 'voice'].includes(draft.kind) &&
+        workflowVersion === 1 && (
+          <CharacterGeneration
+            key={asset._id}
+            asset={asset}
+            media={media}
+            disabled={busy}
+            draftPending={dirty}
+            onSaved={(next) => {
+              if (!dirty) saved(next);
+              onSaved(next);
+            }}
+            onReload={onReload}
+            onRejected={onRejected}
+          />
+        )}
+      {!draft.clipId && draft.kind !== 'voice' && workflowVersion === 1 && (
         <>
           <ProductionBoard
             onChanged={onReload}
@@ -404,6 +423,15 @@ export function AssetEditor({
           </Stack>
           <TextField
             label="Creative brief"
+            helperText={
+              workflowVersion === 1 &&
+              !draft.brief?.trim() &&
+              !['voice', 'sound'].includes(draft.kind)
+                ? 'Production automatically prepares a Creative brief from saved details and source evidence. The draft appears on the approval board for review.'
+                : workflowVersion === 1 && ['character', 'droid'].includes(draft.kind)
+                  ? 'Visual reference brief. The Voice generation prompt above controls voice direction; older voice notes in this brief do not override it.'
+                  : undefined
+            }
             multiline
             minRows={3}
             value={draft.brief}
@@ -419,8 +447,11 @@ export function AssetEditor({
         </Stack>
       </Box>
       <Stack
+        id={assetFinalizationAnchor(draft._id)}
+        tabIndex={-1}
         direction="row"
         sx={{
+          scrollMarginTop: '110px',
           justifyContent: 'space-between',
           alignItems: 'center'
         }}
@@ -492,7 +523,7 @@ export function AssetEditor({
                     })
                   }
                 />
-                {draft.kind === 'voice' && (
+                {draft.kind === 'voice' && !c.generatedVoiceId && (
                   <>
                     <TextField
                       label="ElevenLabs voice ID"
@@ -513,6 +544,13 @@ export function AssetEditor({
                       }
                     />
                   </>
+                )}
+                {draft.kind === 'voice' && c.generatedVoiceId && (
+                  <Alert severity="info">
+                    Listen to this generated audition. Approving it saves the chosen ElevenLabs
+                    voice. Use Generate dialogue in the shot card when you are ready for a
+                    performance.
+                  </Alert>
                 )}
                 {!c.mediaIds.length && <ReferencePreview kind={draft.kind} compact />}
                 <MediaAttachments
@@ -562,7 +600,9 @@ export function AssetEditor({
                     ? 'Keep current choice'
                     : draft.kind === 'sound'
                       ? 'Approve this sound'
-                      : 'Finalize this option'}
+                      : draft.kind === 'voice'
+                        ? 'Approve this voice'
+                        : 'Finalize this option'}
                 </Button>
                 {!c.mediaIds.length && (
                   <Typography variant="caption" color="text.secondary">

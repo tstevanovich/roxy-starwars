@@ -12,8 +12,15 @@ import {
 } from '@mui/material';
 import { useState } from 'react';
 
-import { turnaroundViews } from '../../shared/character-package.js';
+import { characterPackageLayout, turnaroundViews } from '../../shared/character-package.js';
 import { request } from './api.js';
+import {
+  assetFinalizationAnchor,
+  assetImageGenerationAnchor,
+  assetReferenceSetupAnchor,
+  focusSection,
+  reviewAnchor
+} from './review-navigation.js';
 import { mediaUrl } from './studio-utils.js';
 import { ReferencePreview, UploadButton } from './StudioMedia.jsx';
 
@@ -45,6 +52,38 @@ export default function CharacterSheets({
 }) {
   const isProp = asset.kind === 'prop';
   const sheetName = isProp ? 'prop sheet' : 'character sheet';
+  const packageWorkflow = !isProp && asset.sheetLayout === characterPackageLayout;
+  const turnaround = asset.production?.items?.find((item) => item.id === 'body-turnaround');
+  const nextStep = packageWorkflow
+    ? !turnaround
+      ? {
+          anchor: assetReferenceSetupAnchor(asset._id),
+          label: 'Go to reference setup',
+          message:
+            'This package has no body turnaround yet. Add the remaining reference views, then generate and approve the body turnaround to finalize this character reference.'
+        }
+      : !turnaround.mediaId
+        ? {
+            anchor: assetImageGenerationAnchor(asset._id, 'body-turnaround'),
+            label: 'Go to body turnaround',
+            message:
+              'Generate the body turnaround from its image prompt, then review and approve the result to finalize this character reference.'
+          }
+        : {
+            anchor: reviewAnchor(
+              { scope: 'asset', recordId: asset._id },
+              'reference:body-turnaround'
+            ),
+            label: 'Review body turnaround',
+            message:
+              'Review and approve the generated body turnaround to finalize this character reference. Its approval saves the reusable character sheet.'
+          }
+    : {
+        anchor: assetFinalizationAnchor(asset._id),
+        label: 'Go to finalization',
+        message: `Choose a ${isProp ? 'prop' : 'character'} reference in Compare your options and press Finalize this option before adding its ${sheetName}.`
+      };
+
   const views = isProp ? propViews : characterViews;
   const expectedViews = isProp
     ? ['side', 'opposite-side', 'top', 'rear', 'detail']
@@ -179,10 +218,20 @@ export default function CharacterSheets({
             );
           })}
         {!asset.finalChoice ? (
-          <Alert severity="info">
-            {isProp
-              ? 'Finalize the prop’s design before adding its prop sheet.'
-              : 'Finalize the character’s identity before adding its character sheet.'}
+          <Alert
+            severity="info"
+            action={
+              <Button
+                component="a"
+                color="inherit"
+                href={'#' + nextStep.anchor}
+                onClick={() => focusSection(nextStep.anchor)}
+              >
+                {nextStep.label}
+              </Button>
+            }
+          >
+            {nextStep.message}
           </Alert>
         ) : (
           <>

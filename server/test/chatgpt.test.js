@@ -176,6 +176,34 @@ async function respond() {
     tools: [{ type: 'function', name: 'test_tool', parameters: { type: 'object', properties: {} } }]
   });
 }
+test('chat timeouts and transport interruptions are distinct from an expired connection', async () => {
+  await connected();
+  for (const [failure, code, status] of [
+    [new DOMException('Timed out', 'TimeoutError'), 'response_timeout', 504],
+    [new TypeError('fetch failed'), 'transport_error', 502],
+    [new DOMException('Aborted', 'AbortError'), 'request_interrupted', 503]
+  ]) {
+    fetchOverride = async (url) => {
+      if (url.endsWith('/responses')) throw failure;
+    };
+    await assert.rejects(
+      respond(),
+      (error) => error.providerCode === code && error.status === status
+    );
+    assert.equal((await service.status()).connected, true);
+  }
+});
+
+test('interactive GPT-6 plan replies use low reasoning while preserving the selected model', async () => {
+  modelResult = {
+    models: [{ slug: 'gpt-6.1-sol', display_name: 'GPT-6.1 Sol', visibility: 'list' }]
+  };
+  await connected();
+  await respond();
+  const body = JSON.parse(calls.findLast((call) => call.url.endsWith('/responses')).options.body);
+  assert.equal(body.model, 'gpt-6.1-sol');
+  assert.deepEqual(body.reasoning, { effort: 'low' });
+});
 
 test('local PKCE registration validates identity, protects secrets, uses the account catalog and persists one host ID', async () => {
   await start();

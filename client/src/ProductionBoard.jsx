@@ -17,13 +17,19 @@ import {
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { proposalBlocksReview } from '../../shared/production-proposals.js';
+import { cleanRenderPrompt } from '../../shared/render-prompt.js';
 import { shotContinuity } from '../../shared/shot-continuity.js';
 import AnimaticPreview from './AnimaticPreview.jsx';
 import { request } from './api.js';
+import AssetSourceEvidence from './AssetSourceEvidence.jsx';
 import ProductionDrafts from './ProductionDrafts.jsx';
 import { studioUrl } from './project-url.js';
 import { focusSection, reviewAnchor, reviewHref } from './review-navigation.js';
 import ReviewLinks from './ReviewLinks.jsx';
+import SceneBoardEditor from './SceneBoardEditor.jsx';
+import SceneMusic from './SceneMusic.jsx';
+import ShotProductionCard from './ShotProductionCard.jsx';
+import ShotTransitionSummary from './ShotTransitionSummary.jsx';
 import { ReferencePreview } from './StudioMedia.jsx';
 import UpscaleImport from './UpscaleImport.jsx';
 
@@ -83,7 +89,7 @@ function ReviewContent({ row, record, assets, media, disabled, onImportUpscale }
     return (
       <Alert severity="info">
         {row.stage === 'music-plan'
-          ? 'Approving this brief automatically requests one ElevenLabs music audition. Review its complete prompt, duration and credit estimate first.'
+          ? 'Approval saves this music brief. Review its complete prompt, duration and credit estimate, then use Generate music in this section.'
           : 'Listen and approve one individual music audition in the background music panel.'}
         <Button
           component="a"
@@ -114,6 +120,15 @@ function ReviewContent({ row, record, assets, media, disabled, onImportUpscale }
             <Typography fontWeight={600}>Current shot directions</Typography>
             <Typography sx={{ whiteSpace: 'pre-wrap' }}>{clip.action}</Typography>
             <Typography sx={{ mt: 1 }}>{clip.production?.passCondition}</Typography>
+            {clip.production?.startState && (
+              <Typography>Start: {clip.production.startState}</Typography>
+            )}
+            {clip.production?.allowedMotion && (
+              <Typography>Movement: {clip.production.allowedMotion}</Typography>
+            )}
+            {clip.production?.endState && (
+              <Typography>End at cut: {clip.production.endState}</Typography>
+            )}
           </Box>
         )}
         <AnimaticPreview
@@ -137,14 +152,16 @@ function ReviewContent({ row, record, assets, media, disabled, onImportUpscale }
           {item.imagePrompt && (
             <Box>
               <Typography fontWeight={600}>Exact image prompt sent to OpenArt</Typography>
-              <Typography sx={{ whiteSpace: 'pre-wrap' }}>{item.imagePrompt}</Typography>
+              <Typography sx={{ whiteSpace: 'pre-wrap' }}>
+                {cleanRenderPrompt(item.imagePrompt)}
+              </Typography>
             </Box>
           )}
           {revisionPlan && (
             <Alert severity="info">
-              Approve these revised directions to generate one replacement image. Applying the draft
-              saved the plan; it did not approve or render it. The replacement image will need its
-              own approval.
+              Approve these revised directions, then use Generate image for one replacement.
+              Applying or approving the draft saves your choices without rendering. Review the
+              resulting image separately.
             </Alert>
           )}
           {!revisionPlan && item.mediaId && (
@@ -152,22 +169,8 @@ function ReviewContent({ row, record, assets, media, disabled, onImportUpscale }
           )}
         </Stack>
       );
-    return (
-      <Stack spacing={1}>
-        <Typography sx={{ whiteSpace: 'pre-wrap' }}>
-          {row.stage === 'brief' ? record.brief : record.production?.sourceNotes}
-        </Typography>
-        {row.stage === 'source' && record.production?.sourceUrl && (
-          <Button component="a" href={record.production.sourceUrl} target="_blank" rel="noreferrer">
-            Open source footage
-          </Button>
-        )}
-        {row.stage === 'source' &&
-          (record.production?.sourceMediaIds ?? []).map((mid) => (
-            <ReferencePreview key={mid} file={media.find((m) => m._id === mid)} />
-          ))}
-      </Stack>
-    );
+    if (row.stage === 'source') return <AssetSourceEvidence asset={record} media={media} />;
+    return <Typography sx={{ whiteSpace: 'pre-wrap' }}>{record.brief}</Typography>;
   }
   if (row.stage === 'source')
     return (
@@ -219,6 +222,11 @@ function ReviewContent({ row, record, assets, media, disabled, onImportUpscale }
             <Typography sx={{ whiteSpace: 'pre-wrap' }}>{c.production?.beats}</Typography>
             <Typography>{c.dialogue}</Typography>
             <Typography>Pass: {c.production?.passCondition || 'Not set'}</Typography>
+            {c.production?.startState && <Typography>Start: {c.production.startState}</Typography>}
+            {c.production?.allowedMotion && (
+              <Typography>Movement: {c.production.allowedMotion}</Typography>
+            )}
+            {c.production?.endState && <Typography>End at cut: {c.production.endState}</Typography>}
             <Typography variant="body2">
               Reference views:{' '}
               {c.production?.referenceMediaIds?.length
@@ -307,7 +315,8 @@ function ReviewRow({
   onChanged,
   onImportUpscale,
   proposals = empty,
-  jobs = empty
+  jobs = empty,
+  referencePrompts = empty
 }) {
   const anchor = reviewAnchor(row.target, row.stage);
   const generation =
@@ -360,7 +369,8 @@ function ReviewRow({
     [busy, setBusy] = useState(false),
     [error, setError] = useState('');
   const [pendingAction, setPendingAction] = useState(''),
-    [savedReceipt, setSavedReceipt] = useState(null);
+    [savedReceipt, setSavedReceipt] = useState(null),
+    [timingNotice, setTimingNotice] = useState('');
   const receipt =
     savedReceipt ??
     (row.lastAction === 'request-changes' && row.feedback
@@ -373,7 +383,7 @@ function ReviewRow({
   const sourceReview = row.target.scope === 'episode' && row.stage === 'source';
   const canVerify = sourceReview && verifiedSourceIds.length > 0;
   const hasReplacement =
-    ['episode', 'scene'].includes(row.target.scope) &&
+    ['episode', 'scene', 'clip'].includes(row.target.scope) &&
     proposals.some((proposal) => proposalBlocksReview(proposal, row.stage, record, row.target));
   const turnaround = row.automatic && row.stage === 'reference:body-turnaround';
   const turnaroundFile = record.production?.items?.find(
@@ -396,6 +406,12 @@ function ReviewRow({
             body: { revision: row.parentRevision, candidateId: turnaroundCandidate?.id }
           }
         );
+      } else if (action === 'prepare-timing') {
+        const result = await request('/studio/workflow/animatic/prepare', {
+          method: 'POST',
+          body: { target: row.target, parentRevision: row.parentRevision }
+        });
+        setTimingNotice(result.message);
       } else {
         const result = await request('/studio/workflow/review', {
           method: 'POST',
@@ -404,6 +420,9 @@ function ReviewRow({
             stage: row.stage,
             action,
             fingerprint: row.fingerprint,
+            ...(row.stage === 'sound-plan' && row.approvalFingerprint
+              ? { approvalFingerprint: row.approvalFingerprint }
+              : {}),
             parentRevision: row.parentRevision,
             reviewRevision: row.reviewRevision,
             feedback,
@@ -411,6 +430,7 @@ function ReviewRow({
           }
         });
         if (result.receipt) setSavedReceipt(result.receipt);
+        if (result.timingRepair || result.pendingDraft) setTimingNotice(result.message);
       }
       await onChanged();
     } catch (e) {
@@ -469,7 +489,7 @@ function ReviewRow({
     <Accordion
       id={anchor}
       tabIndex={-1}
-      sx={{ scrollMarginTop: '110px' }}
+      sx={{ scrollMarginTop: '200px' }}
       disableGutters
       aria-busy={busy}
       expanded={expanded}
@@ -526,9 +546,9 @@ function ReviewRow({
               )}
               <Typography sx={{ whiteSpace: 'pre-wrap', my: 1 }}>{receipt.feedback}</Typography>
               <Typography variant="body2">
-                This button records feedback; it does not automatically prepare a revision or start
-                a render. Discuss saved feedback opens a production chat with this request filled
-                in. Send that message to start revision work; the chat shows its progress.
+                {timingNotice || (row.stage === 'animatic' && hasReplacement)
+                  ? 'A timing revision draft is ready above. Review and apply it before approving the animatic. No render has started.'
+                  : 'This button records feedback; it does not automatically prepare a revision or start a render. Discuss saved feedback opens a production chat with this request filled in. Send that message to start revision work; the chat shows its progress.'}
               </Typography>
               {row.feedbackIsCurrent === false && (
                 <Typography variant="body2" sx={{ mt: 1 }}>
@@ -549,10 +569,66 @@ function ReviewRow({
             disabled={disabled || (draftPending && row.stage === 'upscale')}
             onImportUpscale={onImportUpscale}
           />
+          {row.target.scope === 'asset' &&
+            row.stage.startsWith('reference:') &&
+            referencePrompts.find((p) => p.itemId === row.stage.slice(10)) && (
+              <Stack spacing={1}>
+                <TextField
+                  label="Saved image generation prompt"
+                  multiline
+                  minRows={4}
+                  maxRows={12}
+                  value={referencePrompts.find((p) => p.itemId === row.stage.slice(10)).prompt}
+                  slotProps={{ input: { readOnly: true } }}
+                />
+                <Button
+                  variant="contained"
+                  disabled={
+                    disabled ||
+                    busy ||
+                    Boolean(
+                      generation &&
+                      [
+                        'queued',
+                        'preparing',
+                        'submitting',
+                        'rendering',
+                        'importing',
+                        'uncertain'
+                      ].includes(generation.status)
+                    )
+                  }
+                  onClick={async () => {
+                    setBusy(true);
+                    setError('');
+                    try {
+                      await request('/studio/assistant/image/generate', {
+                        method: 'POST',
+                        body: {
+                          assetId: record._id,
+                          revision: record.revision,
+                          packageItemId: row.stage.slice(10),
+                          prompt: referencePrompts.find((p) => p.itemId === row.stage.slice(10))
+                            .prompt,
+                          requestId: crypto.randomUUID()
+                        }
+                      });
+                      await onChanged();
+                    } catch (failure) {
+                      setError(failure.message);
+                    } finally {
+                      setBusy(false);
+                    }
+                  }}
+                >
+                  Generate image
+                </Button>
+              </Stack>
+            )}
           {row.retainedApproval && (
             <Alert severity="success">
-              Your existing approval is retained. This shot's approved content and references are
-              unchanged; revisions to other shots do not require you to approve it again.
+              Your existing approval is retained. The approved content and its relevant sources and
+              references are unchanged; edits elsewhere do not require you to approve it again.
             </Alert>
           )}
           {row.coveredByScene && (
@@ -619,6 +695,27 @@ function ReviewRow({
             </Alert>
           )}
           {error && <Alert severity="error">{error}</Alert>}
+          {timingNotice && (
+            <Alert severity="warning">
+              {timingNotice}
+              <Button component="a" href="#production-revisions">
+                Go to timing draft
+              </Button>
+            </Alert>
+          )}
+          {row.stage === 'animatic' && row.timingIssues?.length > 0 && (
+            <Alert severity="warning">
+              {row.timingIssues.map((issue) => (
+                <Typography key={issue.clipId}>{issue.message}</Typography>
+              ))}
+              <Button
+                disabled={disabled || busy || hasReplacement}
+                onClick={() => act('prepare-timing')}
+              >
+                Prepare split or retimed shots
+              </Button>
+            </Alert>
+          )}
           {turnaround && (
             <Button
               variant="contained"
@@ -702,6 +799,8 @@ export default function ProductionBoard({
   media = empty,
   saving = false,
   draftPending = false,
+  onAssetSaved,
+  onRejected,
   onChanged,
   onImportUpscale
 }) {
@@ -710,7 +809,10 @@ export default function ProductionBoard({
   const disabled = saving;
   const [board, setBoard] = useState(null),
     [error, setError] = useState(''),
-    [retrying, setRetrying] = useState(false);
+    [retrying, setRetrying] = useState(false),
+    [starting, setStarting] = useState(false),
+    [startReceipt, setStartReceipt] = useState(''),
+    [jobsExpanded, setJobsExpanded] = useState(false);
   const sequence = useRef({ value: 0 });
   useEffect(() => {
     const followCurrentHash = (event) => {
@@ -723,12 +825,27 @@ export default function ProductionBoard({
     document.addEventListener('click', followCurrentHash);
     return () => document.removeEventListener('click', followCurrentHash);
   }, []);
+  useEffect(() => {
+    let frame;
+    const follow = () => {
+      const anchor = window.location.hash.slice(1);
+      if (anchor !== 'production-jobs' && !anchor.startsWith('production-job-')) return;
+      setJobsExpanded(true);
+      frame = requestAnimationFrame(() => focusSection(anchor));
+    };
+    follow();
+    window.addEventListener('hashchange', follow);
+    return () => {
+      window.removeEventListener('hashchange', follow);
+      cancelAnimationFrame(frame);
+    };
+  }, [board?.jobs?.length]);
   const refresh = useCallback(async () => {
     const requestId = ++sequence.current.value;
     try {
       const next = await request('/studio/workflow/board', {
         method: 'POST',
-        body: { target: { scope, recordId: record._id } }
+        body: { target: { scope, recordId: record._id }, boardVersion: 3 }
       });
       if (requestId !== sequence.current.value) return;
       setBoard(next);
@@ -751,6 +868,121 @@ export default function ProductionBoard({
     await onChanged?.();
   }
   const reviewRecord = board?.record ?? record;
+  const subject = (target) => {
+    const scene = reviewRecord.scenes?.find((s) => s.id === target?.sceneId);
+    return (
+      scene?.clips.find((c) => c.id === target?.clipId)?.title ||
+      scene?.title ||
+      reviewRecord.name ||
+      'Production'
+    );
+  };
+  const inputHref = (step) => {
+    if (step.kind === 'voice' && step.resultAssetId)
+      return studioUrl('/?asset=' + step.resultAssetId);
+    const target = step.target;
+    if (board?.layout === 'scenes' && target?.clipId)
+      return `#picture-prerequisites-${target.clipId}`;
+    if (target?.clipId)
+      return `#shot-${step.kind === 'dialogue' ? 'dialogue' : 'inputs'}-${target.clipId}`;
+    if (target?.assetId)
+      return reviewHref(
+        { scope: 'asset', recordId: target.assetId },
+        target.packageItemId ? 'reference:' + target.packageItemId : 'brief',
+        record._id
+      );
+    if (target?.sceneId && step.kind === 'music') return '#music-' + target.sceneId;
+    return '#production-jobs';
+  };
+  const reviews = (board?.groups ?? [])
+    .filter((g) => !g.optional)
+    .flatMap((g) => g.stages)
+    .filter((r) => r.status !== 'approved' && (r.canApprove || r.status === 'needs-changes'))
+    .map((r) => ({
+      ...r,
+      navigationTitle: [subject(r.target), r.title].join(' / '),
+      navigationHref:
+        board?.layout === 'scenes' && r.target.scope === 'clip'
+          ? `#picture-prerequisites-${r.target.clipId}`
+          : undefined
+    }));
+  const blockedSteps = board?.blockedSteps ?? [];
+  // Keep only the newest attempt for each scope. Older failures remain in job history.
+  const seenTargets = new Set();
+  const failedActions = (board?.automation ?? []).filter((action) => {
+    const key = JSON.stringify(action.target ?? {});
+    if (seenTargets.has(key)) return false;
+    seenTargets.add(key);
+    return action.status === 'failed';
+  });
+  const issues = [
+    ...blockedSteps,
+    ...failedActions.flatMap((action) =>
+      action.failures?.length ? action.failures : [{ error: action.error }]
+    )
+  ].filter(
+    (issue, index, all) =>
+      !all
+        .slice(0, index)
+        .some(
+          (prior) =>
+            prior.error === issue.error &&
+            JSON.stringify(prior.target) === JSON.stringify(issue.target)
+        ) &&
+      !(index >= blockedSteps.length && blockedSteps.some((step) => step.error === issue.error))
+  );
+  const latestJobs = new Map();
+  for (const job of board?.jobs ?? []) {
+    const key = JSON.stringify([job.kind, job.target]);
+    if (!latestJobs.has(key)) latestJobs.set(key, job);
+  }
+  const problemJobs = [...latestJobs.values()].filter((job) =>
+    ['failed', 'uncertain'].includes(job.status)
+  );
+  const renderReview = (row) => (
+    <ReviewRow
+      key={row.key + row.reviewRevision + row.fingerprint}
+      row={row}
+      record={reviewRecord}
+      assets={assets}
+      media={media}
+      proposals={board.proposals}
+      jobs={board.jobs}
+      referencePrompts={board.referencePrompts}
+      disabled={disabled}
+      draftPending={draftPending}
+      onChanged={changed}
+      onImportUpscale={onImportUpscale}
+    />
+  );
+  const renderGroup = (group) => (
+    <Box
+      key={group.title + JSON.stringify(group.target)}
+      component={group.target?.scope === 'clip' ? 'section' : 'div'}
+      aria-label={group.target?.scope === 'clip' ? `Prerequisites: ${group.title}` : undefined}
+      id={
+        group.target?.scope === 'clip' ? `picture-prerequisites-${group.target.clipId}` : undefined
+      }
+      sx={{ scrollMarginTop: '100px' }}
+    >
+      <Typography variant="h3" sx={{ mb: 1 }}>
+        {group.title}
+      </Typography>
+      {group.target?.scope === 'clip' && (
+        <Typography sx={{ mb: 2 }}>
+          Other shots can remain unfinished. Review this shot's composition, timing and generated
+          result here.
+        </Typography>
+      )}
+      {group.optional && (
+        <Typography sx={{ mb: 2 }}>
+          Optional whole-scene reviews. Individual shot approval covers its composition and timed
+          preview.
+        </Typography>
+      )}
+      {group.stages.map(renderReview)}
+    </Box>
+  );
   return (
     <Box
       id="production-approval-board"
@@ -761,37 +993,101 @@ export default function ProductionBoard({
     >
       <Stack spacing={2}>
         <Typography variant="h2">Production approval board</Typography>
+        {board?.layout === 'scenes' && scope === 'episode' && (
+          <Box component="nav" aria-label="Scenes on the production board">
+            <Stack direction="row" sx={{ flexWrap: 'wrap', gap: 1 }}>
+              {reviewRecord.scenes.map((scene, index) => (
+                <Button
+                  key={scene.id}
+                  component="a"
+                  href={`#board-scene-${scene.id}`}
+                  onClick={() => focusSection(`board-scene-${scene.id}`)}
+                >
+                  Scene {index + 1}: {scene.title}
+                </Button>
+              ))}
+            </Stack>
+          </Box>
+        )}
         {board?.enabled && (
           <Box component="nav" aria-label="Approval shortcuts">
-            <Typography fontWeight={600}>Reviews waiting for you</Typography>
-            <ReviewLinks
-              currentId={record._id}
-              prefix="Review"
-              rows={board.groups
-                .filter((g) => !g.optional)
-                .flatMap((g) => g.stages)
-                .filter(
-                  (r) => r.status !== 'approved' && (r.canApprove || r.status === 'needs-changes')
-                )
-                .map((r) => ({
-                  ...r,
-                  navigationTitle: [
-                    reviewRecord.scenes
-                      ?.find((s) => s.id === r.target.sceneId)
-                      ?.clips.find((c) => c.id === r.target.clipId)?.title ||
-                      reviewRecord.scenes?.find((s) => s.id === r.target.sceneId)?.title,
-                    r.title
-                  ]
-                    .filter(Boolean)
-                    .join(' / ')
-                }))}
-            />
+            <Typography fontWeight={600}>Needs your attention</Typography>
+            {reviews.length === 0 && issues.length === 0 && problemJobs.length === 0 && (
+              <Typography variant="body2">
+                No approvals are ready right now. Check the production status below.
+              </Typography>
+            )}
+            <ReviewLinks currentId={record._id} prefix="Review" rows={reviews} />
+            <Stack spacing={1}>
+              {issues.map((issue, index) => (
+                <Alert key={index} severity="warning">
+                  {issue.target ? `${subject(issue.target)}: ` : 'Production could not start: '}
+                  {issue.error}
+                  {issue.kind === 'dialogue' &&
+                    issues.findIndex((i) => i.kind === 'dialogue' && i.error === issue.error) ===
+                      index && (
+                      <Typography variant="body2">
+                        {issue.error.includes('one speaker')
+                          ? 'Use one speaker per clip, for example ROXY: Hello. Split a conversation into separate clips, then save your edits.'
+                          : 'Review the saved voice direction and press Generate voice auditions. After selecting a voice, press Generate dialogue when you are ready.'}
+                      </Typography>
+                    )}
+                  <Button
+                    component="a"
+                    href={inputHref(issue)}
+                    onClick={() => focusSection(inputHref(issue).slice(1))}
+                  >
+                    {issue.kind === 'dialogue'
+                      ? `Edit dialogue for ${subject(issue.target)}`
+                      : issue.target
+                        ? `Review inputs for ${subject(issue.target)}`
+                        : 'Go to production jobs'}
+                  </Button>
+                  {issue.kind === 'dialogue' && !issue.error.includes('one speaker') && (
+                    <Button component="a" href={studioUrl('/?asset=' + (issue.voiceAssetId || ''))}>
+                      Review voice auditions
+                    </Button>
+                  )}
+                </Alert>
+              ))}
+              {problemJobs.map((job) => (
+                <Alert key={job._id} severity="warning">
+                  {job.title}:{' '}
+                  {job.error ||
+                    (job.status === 'uncertain'
+                      ? 'Submission outcome unknown.'
+                      : 'Generation failed.')}
+                  <Button component="a" href={`#production-job-${job._id}`}>
+                    Go to job details for {job.title}
+                  </Button>
+                  <Button
+                    component="a"
+                    href={inputHref(job)}
+                    onClick={() => focusSection(inputHref(job).slice(1))}
+                  >
+                    Review inputs for {subject(job.target)}
+                  </Button>
+                </Alert>
+              ))}
+            </Stack>
           </Box>
         )}
         <Typography>
           Review each stage in order. Approval covers the saved version; changed inputs reopen
           affected downstream reviews.
         </Typography>
+        {scope === 'episode' &&
+          board?.groups?.[0]?.stages.some(
+            (r) => r.stage === 'source' && r.status === 'approved'
+          ) && (
+            <Button
+              component="a"
+              sx={{ alignSelf: 'flex-start' }}
+              href={reviewHref({ scope: 'episode', recordId: record._id }, 'source', record._id)}
+            >
+              Source research approved
+            </Button>
+          )}
         {draftPending && (
           <Alert severity="info" role="note">
             These reviews use the saved version shown on this board. Your unsaved editor draft is
@@ -805,31 +1101,13 @@ export default function ProductionBoard({
           </Alert>
         )}
         {board?.enabled && (
-          <Alert severity="info" role="note">
-            Approval automatically queues the next supported generation step when its prerequisites
-            are approved. Source approval unlocks the saved outline, or queues a replacement if one
-            is missing or needs revision. Outline approval queues a first-scene proposal through
-            your ChatGPT plan. Once a scene script and its references are approved, missing shot and
-            sound plans are prepared automatically for review. Review and apply proposals here or in
-            production chat before approving saved stages. Character packages start with the master
-            portrait; approve it before the remaining images generate. Shot images and dialogue
-            follow an approved shot plan and references. Each video follows its own approved image,
-            storyboard and timed animatic, selected dialogue and the approved sound plan. Other shot
-            storyboards do not block it. One video renders at a time and waits for your review. New
-            Wan takes include native sound; separate mixing is for repairs. Failed renders are not
-            retried automatically.
-          </Alert>
+          <Typography variant="body2">
+            Saving and approving do not generate media. Read the saved prompts, then choose Generate
+            image, Generate video, Generate dialogue or the music generation button. Each action
+            requests one generation.
+          </Typography>
         )}
         {error && <Alert severity="error">{error}</Alert>}
-        {scope === 'episode' &&
-          board?.groups?.[0]?.stages.some(
-            (row) => row.stage === 'source' && row.status === 'approved'
-          ) && (
-            <Alert severity="success" role="note">
-              Source research is approved. Remaining outline or scene drafts are separate workflow
-              steps.
-            </Alert>
-          )}
         <ProductionDrafts
           proposals={board?.proposals}
           record={reviewRecord}
@@ -839,6 +1117,11 @@ export default function ProductionBoard({
         {board?.progress && (
           <Alert severity={board.progress.state === 'blocked' ? 'warning' : 'info'} role="status">
             {board.progress.message}
+            {['blocked', 'working'].includes(board.progress.state) && board.jobs?.length > 0 && (
+              <Button component="a" href="#production-jobs">
+                Go to production jobs
+              </Button>
+            )}
             {board.progress.review && (
               <Button
                 component="a"
@@ -969,25 +1252,26 @@ export default function ProductionBoard({
             Retry failed requests ({board.progress.retrySteps.length})
           </Button>
         )}
-        {disabled && (
-          <Alert severity="info">Save your draft before reviewing production stages.</Alert>
-        )}
         {board?.automation
-          ?.filter((a) => ['queued', 'running', 'failed'].includes(a.status))
+          ?.filter((a) => ['queued', 'running'].includes(a.status))
           .map((action) => (
             <Alert key={action._id} severity={action.status === 'failed' ? 'warning' : 'info'}>
-              {action.status === 'failed'
-                ? `Approval saved. The next step needs attention: ${action.error}`
-                : 'Next production step queued. Jobs continue when you leave this page.'}
+              Next production step {action.status === 'running' ? 'is being prepared' : 'queued'}.
+              Jobs continue when you leave this page.
             </Alert>
           ))}
         {board?.enabled && board.nextSteps?.length > 0 && (
           <Button
             variant="contained"
             disabled={
-              disabled || board.automation?.some((a) => ['queued', 'running'].includes(a.status))
+              disabled ||
+              starting ||
+              board.automation?.some((a) => ['queued', 'running'].includes(a.status))
             }
             onClick={async () => {
+              setStarting(true);
+              setError('');
+              setStartReceipt('');
               try {
                 await request('/studio/workflow/advance', {
                   method: 'POST',
@@ -996,35 +1280,89 @@ export default function ProductionBoard({
                     parentRevision: reviewRecord.revision
                   }
                 });
+                setStartReceipt(
+                  'Production step queued. Each request is checked before a job is created. Follow its status in production jobs below.'
+                );
                 await refresh();
               } catch (e) {
                 setError(e.message);
+              } finally {
+                setStarting(false);
               }
             }}
           >
-            Start next production step ({board.nextSteps.length}{' '}
-            {board.nextSteps.some((step) => step.kind.startsWith('story-')) ? 'requests' : 'jobs'})
+            {starting
+              ? 'Starting production…'
+              : `Start next production step (${board.nextSteps.length} ${board.nextSteps.length === 1 ? 'request' : 'requests'})`}
           </Button>
         )}
-        {board?.jobs?.length > 0 && (
-          <Accordion>
+        {startReceipt && (
+          <Alert severity="info" role="status">
+            {startReceipt}
+            <Button component="a" href="#production-jobs">
+              Go to production jobs
+            </Button>
+          </Alert>
+        )}
+        {board?.enabled && !board.nextSteps?.length && blockedSteps.length > 0 && (
+          <Typography role="status">
+            No production requests are ready to start. Resolve the linked problems above, save your
+            changes, and review any reopened approvals.
+          </Typography>
+        )}
+        {board?.enabled && board.nextSteps?.length > 0 && (
+          <Box>
+            <Typography variant="body2">Ready to request:</Typography>
+            <Stack component="ul" sx={{ my: 0, pl: 3 }}>
+              {board.nextSteps.map((step, index) => (
+                <Typography component="li" variant="body2" key={step.requestId || index}>
+                  {step.kind} · {subject(step.target)}
+                </Typography>
+              ))}
+            </Stack>
+          </Box>
+        )}
+        {board?.enabled && (
+          <Accordion
+            id="production-jobs"
+            tabIndex={-1}
+            sx={{ scrollMarginTop: '200px' }}
+            expanded={jobsExpanded}
+            onChange={(_event, open) => setJobsExpanded(open)}
+          >
             <AccordionSummary expandIcon={<ExpandMoreOutlined />}>
               Production jobs and retries
             </AccordionSummary>
             <AccordionDetails>
               <Stack spacing={1}>
-                {board.jobs.map((job) => (
+                {!board.jobs?.length && (
+                  <Typography>
+                    No production jobs yet. Queued requests will appear here after preparation.
+                  </Typography>
+                )}
+                {(board.jobs ?? []).map((job) => (
                   <Alert
                     key={job._id}
+                    aria-label={`Production job: ${job.title}`}
+                    id={`production-job-${job._id}`}
+                    tabIndex={-1}
+                    sx={{ scrollMarginTop: '200px' }}
                     severity={['failed', 'uncertain'].includes(job.status) ? 'warning' : 'info'}
                   >
                     {job.title}: {job.status}. {job.error}
                     {job.quote?.items?.[0] &&
                       ` Quoted ${job.quote.items[0].totalCredits} list credits for the recorded configuration.`}
+                    <Button
+                      component="a"
+                      href={inputHref(job)}
+                      onClick={() => focusSection(inputHref(job).slice(1))}
+                    >
+                      Review inputs for {subject(job.target)}
+                    </Button>
                   </Alert>
                 ))}
-                {board.jobs.filter((j) => ['failed', 'uncertain'].includes(j.status)).length >=
-                  2 && (
+                {(board.jobs ?? []).filter((j) => ['failed', 'uncertain'].includes(j.status))
+                  .length >= 2 && (
                   <Alert severity="warning">
                     Review the failure reasons and change the cause before another retry. Paid
                     failures are not resubmitted automatically.
@@ -1054,55 +1392,150 @@ export default function ProductionBoard({
               Enable approval workflow for this project
             </Button>
           </>
+        ) : board?.layout === 'scenes' && scope === 'episode' ? (
+          <>
+            {board.groups
+              .filter(
+                (g) => g.target.scope === 'episode' && !g.stages.some((r) => r.stage === 'export')
+              )
+              .map(renderGroup)}
+            {reviewRecord.scenes.map((scene, sceneIndex) => {
+              const groups = board.groups.filter((g) => g.target.sceneId === scene.id);
+              const preparation = groups.find(
+                (g) => g.target.scope === 'scene' && g.stages.some((r) => r.stage === 'script')
+              );
+              return (
+                <Box
+                  key={scene.id}
+                  component="section"
+                  aria-label={`Scene ${sceneIndex + 1}: ${scene.title}`}
+                  sx={{ borderTop: 1, borderColor: 'divider', pt: 3 }}
+                >
+                  <Stack spacing={2}>
+                    <Typography
+                      variant="h2"
+                      id={`board-scene-${scene.id}`}
+                      tabIndex={-1}
+                      className="scene-heading"
+                    >
+                      Scene {sceneIndex + 1}: {scene.title}
+                    </Typography>
+                    <Button
+                      component="a"
+                      href={`#board-scene-edit-${scene.id}`}
+                      onClick={() => focusSection(`board-scene-edit-${scene.id}`)}
+                      sx={{ alignSelf: 'flex-start' }}
+                    >
+                      Edit this scene
+                    </Button>
+                    <Typography>
+                      {scene.clips.length} shots · Work on one video at a time. Image, dialogue,
+                      shot approval and finished video review stay together below.
+                    </Typography>
+                    <ShotTransitionSummary
+                      episodeId={reviewRecord._id}
+                      scene={scene}
+                      scenes={reviewRecord.scenes}
+                      assets={assets}
+                      media={media}
+                    />
+                    {preparation && (
+                      <Box
+                        component="details"
+                        open={preparation.stages.some((r) => r.status !== 'approved')}
+                      >
+                        <Typography component="summary" sx={{ cursor: 'pointer', fontWeight: 600 }}>
+                          Shared scene preparation
+                        </Typography>
+                        {preparation.stages.map(renderReview)}
+                      </Box>
+                    )}
+                    <SceneBoardEditor
+                      episode={reviewRecord}
+                      scene={scene}
+                      disabled={disabled}
+                      onChanged={changed}
+                    >
+                      {({ draftScene, editClip, dirty, busy, save }) => (
+                        <>
+                          {scene.clips.map((clip, index) => (
+                            <ShotProductionCard
+                              key={clip.id}
+                              episode={reviewRecord}
+                              scene={scene}
+                              clip={clip}
+                              index={index}
+                              rows={
+                                groups.find(
+                                  (g) => g.target.scope === 'clip' && g.target.clipId === clip.id
+                                )?.stages ?? []
+                              }
+                              sceneRows={preparation?.stages ?? []}
+                              assets={assets}
+                              media={media}
+                              transitionChoices={board.transitionChoices ?? []}
+                              jobs={board.jobs}
+                              proposals={board.proposals}
+                              prompts={board.shotPrompts?.find(
+                                (p) => p.sceneId === scene.id && p.clipId === clip.id
+                              )}
+                              voicePrompts={board.voicePrompts?.filter(
+                                (p) => p.sceneId === scene.id && p.clipId === clip.id
+                              )}
+                              draftClip={draftScene.clips.find((c) => c.id === clip.id)}
+                              draftScene={draftScene}
+                              onEdit={(change) => editClip(clip.id, change)}
+                              onSaveScene={save}
+                              sceneDirty={dirty}
+                              editingDisabled={disabled || busy}
+                              disabled={disabled || busy || dirty}
+                              onChanged={changed}
+                              onAssetSaved={onAssetSaved}
+                              onRejected={onRejected}
+                              renderReview={renderReview}
+                            />
+                          ))}
+                        </>
+                      )}
+                    </SceneBoardEditor>
+                    <Box component="details">
+                      <Typography component="summary" sx={{ cursor: 'pointer', fontWeight: 600 }}>
+                        Background music for this section
+                      </Typography>
+                      <SceneMusic
+                        episode={reviewRecord}
+                        scene={scene}
+                        dirty={false}
+                        busy={disabled}
+                        onReload={changed}
+                      />
+                    </Box>
+                    {groups
+                      .filter((g) => g.target.scope === 'scene' && g !== preparation)
+                      .map((g) =>
+                        g.optional ? (
+                          <Box component="details" key={g.title}>
+                            <Typography component="summary" sx={{ cursor: 'pointer' }}>
+                              {g.title}
+                            </Typography>
+                            {g.stages.map(renderReview)}
+                          </Box>
+                        ) : (
+                          renderGroup(g)
+                        )
+                      )}
+                  </Stack>
+                </Box>
+              );
+            })}
+            {board.groups
+              .filter(
+                (g) => g.target.scope === 'episode' && g.stages.some((r) => r.stage === 'export')
+              )
+              .map(renderGroup)}
+          </>
         ) : (
-          board?.groups.map((group) => (
-            <Box
-              key={group.title + JSON.stringify(group.target)}
-              component={group.target?.scope === 'clip' ? 'section' : 'div'}
-              aria-label={
-                group.target?.scope === 'clip' ? `Prerequisites: ${group.title}` : undefined
-              }
-              id={
-                group.target?.scope === 'clip'
-                  ? `picture-prerequisites-${group.target.clipId}`
-                  : undefined
-              }
-              sx={{ scrollMarginTop: '100px' }}
-            >
-              <Typography variant="h3" sx={{ mb: 1 }}>
-                {group.title}
-              </Typography>
-              {group.target?.scope === 'clip' && (
-                <Typography sx={{ mb: 2 }}>
-                  Approve this clip's storyboard, then its timed animatic. When its image, dialogue
-                  and shared scene prerequisites are approved, the video queues automatically. Other
-                  shots can remain unfinished. Review each generated video before advancing.
-                </Typography>
-              )}
-              {group.optional && (
-                <Typography sx={{ mb: 2 }}>
-                  Optional: review all shots together. These approvals cover the individual clips,
-                  but are not required when you approve each clip's storyboard and timing
-                  separately.
-                </Typography>
-              )}
-              {group.stages.map((row) => (
-                <ReviewRow
-                  key={row.key + row.reviewRevision + row.fingerprint}
-                  row={row}
-                  record={reviewRecord}
-                  assets={assets}
-                  media={media}
-                  proposals={board.proposals}
-                  jobs={board.jobs}
-                  disabled={disabled}
-                  draftPending={draftPending}
-                  onChanged={changed}
-                  onImportUpscale={onImportUpscale}
-                />
-              ))}
-            </Box>
-          ))
+          board?.groups.map(renderGroup)
         )}
       </Stack>
     </Box>
