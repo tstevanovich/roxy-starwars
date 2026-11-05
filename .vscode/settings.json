@@ -17,9 +17,10 @@
   "files.eol": "\n",
   "files.insertFinalNewline": true,
   "files.trimTrailingWhitespace": true,
-  "js/ts.tsdk.path": "node_modules/typescript/lib",
   "prettier.requireConfig": true,
   "scss.validate": false,
   "stylelint.lintFiles.glob": "client/src/**/*.{css,scss}",
-  "stylelint.validate": ["css", "scss"]
+  "stylelint.validate": ["css", "scss"],
+  "js/ts.tsdk.path": "node_modules/typescript/lib",
+  "js/ts.tsdk.promptToUseWorkspaceVersion": true
 }

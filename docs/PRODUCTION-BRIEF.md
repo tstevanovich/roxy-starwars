@@ -51,7 +51,7 @@ The [ElevenLabs speech API](https://elevenlabs.io/docs/api-reference/text-to-spe
 
 ## Image production and model selection
 
-Use OpenArt **GPT Image 2.5 Sunburst** (`gpt-image-2-5-sunburst`) for all image production: characters, droids, props, wardrobes, ships, environments, and episode stills. The current default is 2K, high quality, 16:9, PNG. Use approved image references to carry character identity, the episode outfit, ship geometry, locations, and props into each composition. The shared application policy is stored in `shared/production-defaults.js` and returned with clip prompt previews.
+Use OpenArt **GPT Image 2.5 Sunburst** (`gpt-image-2-5-sunburst`) for all image production: characters, droids, props, wardrobes, ships, environments, and episode stills. The current default is 2K, high quality, 16:9, PNG. Use approved image references to carry character identity, the episode outfit, ship geometry, locations, and props into each composition. The shared application policy is stored in `shared/production-defaults.ts` and returned with clip prompt previews.
 
 The user selected GPT Image 2.5 after comparing exterior and cockpit renders from GPT Image 2.5 Sunburst, Grok Imagine Image 2.0, and Seedream 5 Pro. This replaces Nano Banana as the default for all image categories. Preserve earlier images and their original model provenance. Re-render the active production library as new candidates using selected designs as references; the user reviews the complete batch before finalizing replacements. A model change does not itself approve a new identity, sheet, set, or scene. Exact provider forms and complete reference packs must be included in price quotes.
 

@@ -7,5 +7,11 @@ export default {
       extends: ['stylelint-config-standard-scss']
     }
   ],
-  ignoreFiles: ['**/node_modules/**', '**/dist/**', '**/coverage/**', '**/*.min.{css,scss}']
+  ignoreFiles: [
+    '.data/**',
+    '**/node_modules/**',
+    '**/dist/**',
+    '**/coverage/**',
+    '**/*.min.{css,scss}'
+  ]
 };

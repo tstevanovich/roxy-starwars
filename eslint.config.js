@@ -9,7 +9,10 @@ import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
 export default defineConfig([
-  { ignores: ['**/node_modules/**', '**/dist/**', '**/coverage/**', '.data/**'] },
+  {
+    ignores: ['**/node_modules/**', '**/dist/**', '**/coverage/**', '.data/**']
+  },
+  { linterOptions: { reportUnusedDisableDirectives: 'error' } },
   js.configs.recommended,
   {
     files: ['**/*.{js,jsx,mjs,cjs,ts,tsx,mts,cts}'],
@@ -25,7 +28,7 @@ export default defineConfig([
     rules: { 'no-unused-vars': ['error', { argsIgnorePattern: '^_' }] }
   },
   {
-    files: ['client/src/**/*.{js,jsx,ts,tsx}'],
+    files: ['client/src/**/*.{ts,tsx}'],
     ...reactHooks.configs.flat.recommended,
     languageOptions: {
       globals: globals.browser,
@@ -42,8 +45,13 @@ export default defineConfig([
     }
   },
   {
+    files: ['server/**/*.ts', 'scripts/**/*.ts', 'client/*.config.ts'],
+    languageOptions: { globals: globals.node }
+  },
+  {
     files: ['**/*.{ts,tsx,mts,cts}'],
     extends: [tseslint.configs.recommended],
+    languageOptions: { parserOptions: { tsconfigRootDir: import.meta.dirname } },
     rules: {
       '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }]
     }

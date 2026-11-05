@@ -4,6 +4,8 @@ Open **Production chat** in the studio menu on desktop or phone. The assistant c
 
 Studio chat uses **Sign in with ChatGPT and your eligible ChatGPT plan**, with no API-key billing fallback. It reads the saved production brief and studio records. It does not import other ChatGPT/Codex conversations. OpenAI processes the AI requests; running the studio locally does not make the language model run offline.
 
+Developers should read the [TypeScript development guide](TYPESCRIPT.md) for source layout, checks and native Node execution.
+
 ## Morning setup: connect ChatGPT on the studio PC
 
 1. On the studio PC, open **http://127.0.0.1:5000/?chat=1** and sign in to the studio with your existing owner login.
@@ -11,7 +13,7 @@ Studio chat uses **Sign in with ChatGPT and your eligible ChatGPT plan**, with n
 3. Follow **Return to production chat**. Dismiss the one-time plan explanation with **Got it**.
 4. Open Connections and choose a **ChatGPT model** from the account's discovered catalog. **Test connection** makes a short request using your plan. A sign-in badge or populated catalog alone does not prove that inference is available; a completed test/reply does.
 5. Use **Manage usage** to review this app's permissions, plan/app limits and credits settings in ChatGPT. Eligible requests draw from your ChatGPT plan or available credits according to those settings. The studio does not purchase credits or switch to API-key billing when limits are reached.
-6. Connect **OpenArt** separately if needed, from either the studio PC or its remote address. Check the prefilled Roxy OpenArt project ID and use **Test OpenArt connection**. The separate reference-sharing status shows whether the public HTTPS address is configured; keep the remote tunnel running so OpenArt can fetch local files.
+6. Connect **OpenArt** separately if needed, from either the studio PC or its remote address. Check the prefilled Roxy OpenArt project ID and use **Test OpenArt connection**. Reference-sharing status confirms OpenArt storage availability. Generation references are uploaded to OpenArt storage; the remote tunnel provides access to the studio UI.
 
 The initial ChatGPT sign-in must happen in a browser on the PC that runs the server. OpenAI's local-personal-app flow returns to an HTTP listener on `127.0.0.1`. After setup, the PC handles requests and token renewal for the authenticated mobile website; the phone does not need its own ChatGPT sign-in. The Connections screen explains this and disables starting local ChatGPT sign-in from a remote address. Your studio owner login remains separate and is required on every device.
 
@@ -37,6 +39,8 @@ Official references: [local ChatGPT plan usage](https://developers.openai.com/si
 
 Use **Discuss in chat** on an asset or episode, or **Discuss this clip** inside an episode. A new conversation can focus on the whole series, an asset, an episode, a scene or a clip. The assistant works from saved content; save local editor changes before asking it to revise them.
 
+Each scene heading on the episode board has **Discuss this scene**. It opens a reusable conversation for the entire scene in a separate tab. Shot conversations also have **Open scene chat** for changes that add, split or reorder shots. A shot-only draft cannot insert sibling shots: it reports the scope mismatch instead of silently dropping the added dialogue. Scene planning drafts retain new shots while preserving unchanged shots and selections. Applying a draft saves the edit; generation still requires its own Generate button.
+
 Example requests:
 
 - “Read the current third scene and give Roxy a sharper final line. Keep Tavin recurring without a relationship.”
@@ -60,7 +64,7 @@ The chat has no approval/finalization/deletion tool. The existing review screens
 - Each image request produces **one** separately reviewable candidate. Character, droid and prop requests specify a multiview reference sheet. Existing finalized choices remain authoritative while a replacement is pending.
 - Scene production requires the current scene script and linked creative references to be approved/finalized.
 - Video additionally requires exactly one approved clip image and selected dialogue whenever the clip has speech. Pending replacement images or unfinished image/dialogue jobs block video, even if an earlier image was approved.
-- Image settings are GPT Image 2.5 Sunburst, 2K, high quality, 16:9. Video settings are Wan 3.0 Standard, 480p, 16:9, 2–30 seconds, sound effects and no music. Spoken clips reference the selected ElevenLabs recording using Wan's voice-reference mode. This generates a performance using that reference; it is not a promise of sample-identical audio. Review voice and lip sync before approval.
+- Image settings are GPT Image 2.5 Sunburst, 2K, high quality, 16:9. Video settings are Wan 3.0 Standard, 1080p, 16:9, 2–30 seconds, sound effects and no music. Spoken clips reference the selected ElevenLabs recording using Wan's voice-reference mode. This generates a performance using that reference; it is not a promise of sample-identical audio. Review voice and lip sync before approval.
 - OpenArt form/cost calls precede submission. Insufficient credits block the request. The user has authorized the costs of requested renders; there is no repeated credit-permission dialog. Up to six production requests can be created per assistant turn.
 - Finished originals are downloaded into the local media library and attached as unselected candidates/takes. **Review image options** or **Open episode for review** opens the existing approval screen.
 
@@ -80,7 +84,7 @@ Known OpenArt history IDs are retained across server restarts, and polling resum
 
 The conversation composer retains unsent text, attachments and its request ID in that browser. Retrying a request after a network failure uses the same ID to avoid duplicate messages. Saved conversation history is shared across your devices. ChatGPT credentials are never stored with browser drafts.
 
-Approved-video upscaling continues to use the studio's existing upscale queue. Production chat does not claim an upscale was submitted unless that separate provider workflow has actually done so.
+Video generation uses Wan 3.0 Standard at native 1920 x 1080. Approvals do not queue upscales; the old upscale endpoint, queue and review stage have been retired. Previously saved high-resolution delivery links remain readable.
 
 ## Verification boundary
 

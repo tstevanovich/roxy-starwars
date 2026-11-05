@@ -2,6 +2,8 @@
   "recommendations": [
     "dbaeumer.vscode-eslint",
     "esbenp.prettier-vscode",
+    "redhat.vscode-xml",
+    "redhat.vscode-yaml",
     "stylelint.vscode-stylelint"
   ]
 }
